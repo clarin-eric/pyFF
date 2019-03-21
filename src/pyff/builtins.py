@@ -2,8 +2,6 @@
 for pyFF.
 """
 
-from __future__ import absolute_import, print_function
-
 import base64
 import hashlib
 import json
@@ -16,26 +14,26 @@ import operator
 import os
 import re
 import xmlsec
-import yaml
 from iso8601 import iso8601
 from lxml.etree import DocumentInvalid
-from .constants import NS
+from .constants import NS, config
 from .decorators import deprecated
-from .logs import log
+from .logs import get_log
 from .pipes import Plumbing, PipeException, PipelineCallback, pipe
-from .stats import set_metadata_info
-from .utils import total_seconds, dumptree, safe_write, root, with_tree, duration2timedelta, xslt_transform, validate_document
+from .utils import total_seconds, dumptree, safe_write, root, with_tree, duration2timedelta, xslt_transform, \
+    validate_document, hash_id
 from .samlmd import sort_entities, iter_entities, annotate_entity, set_entity_attributes, \
-    discojson, set_pubinfo, set_reginfo, find_in_document, entitiesdescriptor
+    discojson_t, set_pubinfo, set_reginfo, find_in_document, entitiesdescriptor, set_nodecountry
 from .fetch import Resource
-from six import StringIO
 from six.moves.urllib_parse import urlparse
 from .exceptions import MetadataException
 from .store import make_store_instance
+import six
 
 __author__ = 'leifj'
 
 FILESPEC_REGEX = "([^ \t\n\r\f\v]+)\s+as\s+([^ \t\n\r\f\v]+)"
+log = get_log(__name__)
 
 
 @pipe
@@ -52,6 +50,22 @@ Print a representation of the entities set on stdout. Useful for testing.
     else:
         print("<EntitiesDescriptor xmlns=\"{}\"/>".format(NS['md']))
 
+
+@pipe(name="print")
+def _print_t(req, *opts):
+    """
+
+    Print whatever is in the active tree without transformation
+
+    :param req: The request
+    :param opts: Options (unused)
+    :return:
+    """
+    fn = req.args.get('output', None)
+    if fn is not None:
+        safe_write(fn, req.t)
+    else:
+        print(req.t)
 
 @pipe
 def end(req, *opts):
@@ -318,7 +332,7 @@ Options are put directly after "sort". E.g:
     if req.t is None:
         raise PipeException("Unable to sort empty document.")
 
-    opts = dict(zip(opts[0:1], [" ".join(opts[1:])]))
+    opts = dict(list(zip(opts[0:1], [" ".join(opts[1:])])))
     opts.setdefault('order_by', None)
     sort_entities(req.t, opts['order_by'])
 
@@ -362,22 +376,24 @@ Publish the working document in XML form.
         output_file = req.args[0]
     if output_file is not None:
         output_file = output_file.strip()
-        log.debug("publish {}".format(output_file))
         resource_name = output_file
         m = re.match(FILESPEC_REGEX, output_file)
         if m:
             output_file = m.group(1)
             resource_name = m.group(2)
-        log.debug("output_file={}, resource_name={}".format(output_file, resource_name))
         out = output_file
         if os.path.isdir(output_file):
             out = "{}.xml".format(os.path.join(output_file, req.id))
-        safe_write(out, dumptree(req.t))
+
+        data = dumptree(req.t)
+
+        safe_write(out, data)
         req.store.update(req.t, tid=resource_name)  # TODO maybe this is not the right thing to do anymore
     return req.t
 
 
 @pipe
+@deprecated(reason="stats subsystem was removed")
 def loadstats(req, *opts):
     """
     Log (INFO) information about the result of the last call to load
@@ -385,23 +401,11 @@ def loadstats(req, *opts):
     :param opts: Options: (none)
     :return: None
     """
-    from .stats import metadata
-    _stats = None
-    try:
-        if 'json' in opts:
-            _stats = json.dumps(metadata)
-        else:
-            buf = StringIO()
-            yaml.dump(metadata, buf)
-            _stats = buf.getvalue()
-    except Exception as ex:
-        log.error(ex)
-
-    log.info("pyff loadstats: %s" % _stats)
+    log.info("pyff loadstats has been deprecated")
 
 
 @pipe
-@deprecated
+@deprecated(reason="replaced with load")
 def remote(req, *opts):
     """Deprecated. Calls :py:mod:`pyff.pipes.builtins.load`.
     """
@@ -409,7 +413,7 @@ def remote(req, *opts):
 
 
 @pipe
-@deprecated
+@deprecated(reason="replaced with load")
 def local(req, *opts):
     """Deprecated. Calls :py:mod:`pyff.pipes.builtins.load`.
     """
@@ -417,7 +421,7 @@ def local(req, *opts):
 
 
 @pipe
-@deprecated
+@deprecated(reason="replaced with load")
 def _fetch(req, *opts):
     return load(req, *opts)
 
@@ -458,7 +462,7 @@ Defaults are marked with (*)
                                  fail_on_error controls whether failure to validating the entire MD file will abort
                                  processing of the pipeline.
     """
-    opts = dict(zip(opts[::2], opts[1::2]))
+    opts = dict(list(zip(opts[::2], opts[1::2])))
     opts.setdefault('timeout', 120)
     opts.setdefault('max_workers', 5)
     opts.setdefault('validate', "True")
@@ -480,28 +484,27 @@ Defaults are marked with (*)
             "Usage: load resource [as url] [[verify] verification] [via pipeline] [cleanup pipeline]")
 
         url = r.pop(0)
-        params = dict()
+        params = {"via": [],"cleanup": [],"verify": None, "as": url}
 
         while len(r) > 0:
             elt = r.pop(0)
             if elt in ("as", "verify", "via", "cleanup"):
                 if len(r) > 0:
-                    params[elt] = r.pop(0)
+                    if elt in ("via", "cleanup"):
+                        params[elt].append(r.pop(0))
+                    else:
+                        params[elt] = r.pop(0)
                 else:
-                    raise PipeException("Usage: load resource [as url] [[verify] verification] [via pipeline] [cleanup pipeline]")
+                    raise PipeException(
+                        "Usage: load resource [as url] [[verify] verification] [via pipeline]* [cleanup pipeline]*")
             else:
                 params['verify'] = elt
 
-        for elt in ("verify", "via", "cleanup"):
-            params.setdefault(elt, None)
-
-        params.setdefault('as', url)
-
         if params['via'] is not None:
-            params['via'] = PipelineCallback(params['via'], req, store=store)
+            params['via'] = [PipelineCallback(pipe, req, store=store) for pipe in params['via']]
 
         if params['cleanup'] is not None:
-            params['cleanup'] = PipelineCallback(params['cleanup'], req, store=store)
+            params['cleanup'] = [PipelineCallback(pipe, req, store=store) for pipe in params['cleanup']]
 
         params.update(opts)
 
@@ -515,7 +518,6 @@ Defaults are marked with (*)
 
 def _select_args(req):
     args = req.args
-    log.debug("selecting using args: %s" % args)
     if args is None and 'select' in req.state:
         args = [req.state.get('select')]
     if args is None:
@@ -524,6 +526,8 @@ def _select_args(req):
         args = req.store.lookup('entities')
     if args is None or not args:
         args = []
+
+    log.debug("selecting using args: %s" % args)
 
     return args
 
@@ -593,24 +597,19 @@ alias invisible for anything except the corresponding mime type.
     """
     args = _select_args(req)
     name = req.plumbing.id
-    alias = False
     if len(opts) > 0:
         if opts[0] != 'as' and len(opts) == 1:
             name = opts[0]
-            alias = True
         if opts[0] == 'as' and len(opts) == 2:
             name = opts[1]
-            alias = True
 
-    ot = entitiesdescriptor(args, name, lookup_fn=req.md.lookup)
+    ot = entitiesdescriptor(args, name, lookup_fn=req.md.store.select)
     if ot is None:
         raise PipeException("empty select - stop")
 
-    if alias:
-        nfo = dict(Status='default', Description="Synthetic collection")
+    if req.plumbing.id != name:
+        log.debug("storing synthentic collection {}".format(name))
         n = req.store.update(ot, name)
-        nfo['Size'] = str(n)
-        set_metadata_info(name, nfo)
 
     return ot
 
@@ -652,10 +651,7 @@ def _filter(req, *opts):
 
     ot = entitiesdescriptor(args, name, lookup_fn=lambda member: find_in_document(req.t, member), copy=False)
     if alias:
-        nfo = dict(Status='default', Description="Synthetic collection")
         n = req.store.update(ot, name)
-        nfo['Size'] = str(n)
-        set_metadata_info(name, nfo)
 
     req.t = None
 
@@ -678,7 +674,7 @@ Select a set of EntityDescriptor elements as a working document but don't valida
 Useful for testing. See py:mod:`pyff.pipes.builtins.pick` for more information about selecting the document.
     """
     args = _select_args(req)
-    ot = entitiesdescriptor(args, req.plumbing.id, lookup_fn=req.md.lookup, validate=False)
+    ot = entitiesdescriptor(args, req.plumbing.id, lookup_fn=req.md.store.lookup, validate=False)
     if ot is None:
         raise PipeException("empty select '%s' - stop" % ",".join(args))
     return ot
@@ -725,7 +721,7 @@ Return a discojuice-compatible json representation of the tree
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
-    res = [discojson(e) for e in iter_entities(req.t)]
+    res = discojson_t(req.t)
     res.sort(key=operator.itemgetter('title'))
 
     return json.dumps(res)
@@ -835,6 +831,20 @@ Display statistics about the current working document.
     return req.t
 
 
+@pipe
+def summary(req, *opts):
+    """
+    Display a summary of the repository
+    :param req:
+    :param opts:
+    :return:
+    """
+    if req.t is None:
+        raise PipeException("Your pipeline is missing a select statement.")
+
+    return dict(size=req.store.size())
+
+
 @pipe(name='store')
 def _store(req, *opts):
     """
@@ -864,14 +874,10 @@ before you call store.
         if not os.path.isdir(target_dir):
             os.makedirs(target_dir)
         for e in iter_entities(req.t):
-            eid = e.get('entityID')
-            if eid is None or len(eid) == 0:
-                raise PipeException("Missing entityID in %s" % e)
-            m = hashlib.sha1()
-            m.update(eid)
-            d = m.hexdigest()
-            safe_write("%s.xml" % os.path.join(target_dir, d), dumptree(e, pretty_print=True))
+            fn = hash_id(e, prefix=False)
+            safe_write("%s.xml" % os.path.join(target_dir, fn), dumptree(e, pretty_print=True))
     return req.t
+
 
 
 @pipe
@@ -903,13 +909,12 @@ user-supplied file. The rest of the keyword arguments are made available as stri
     if stylesheet is None:
         raise PipeException("xslt requires stylesheet")
 
-    params = dict((k, "\'%s\'" % v) for (k, v) in req.args.items())
+    params = dict((k, "\'%s\'" % v) for (k, v) in list(req.args.items()))
     del params['stylesheet']
     try:
         return xslt_transform(req.t, stylesheet, params)
-        # log.debug(ot)
     except Exception as ex:
-        traceback.print_exc(ex)
+        log.debug(traceback.format_exc())
         raise ex
 
 
@@ -972,6 +977,7 @@ This example would drop the first Signature element only.
 
     return req.t
 
+
 @pipe
 def check_xml_namespaces(req, *opts):
     """
@@ -984,15 +990,17 @@ def check_xml_namespaces(req, *opts):
         raise PipeException("Your pipeline is missing a select statement.")
 
     def _verify(elt):
-        if isinstance(elt.tag, basestring):
-            for prefix, uri in elt.nsmap.items():
+        if isinstance(elt.tag, six.string_types):
+            for prefix, uri in list(elt.nsmap.items()):
                 if not uri.startswith('urn:'):
                     u = urlparse(uri)
-                    if u.scheme not in ('http','https'):
-                        raise MetadataException("Namespace URIs must be be http(s) URIs ('{}' declared on {})".format(uri,elt.tag))
+                    if u.scheme not in ('http', 'https'):
+                        raise MetadataException(
+                            "Namespace URIs must be be http(s) URIs ('{}' declared on {})".format(uri, elt.tag))
 
     with_tree(root(req.t), _verify)
     return req.t
+
 
 @pipe
 def certreport(req, *opts):
@@ -1103,6 +1111,7 @@ HTML.
 
                     req.store.update(entity_elt)
             except Exception as ex:
+                log.debug(traceback.format_exc())
                 log.error(ex)
 
 
@@ -1143,13 +1152,17 @@ Content-Type HTTP response header.
 
     if d is not None:
         m = hashlib.sha1()
+        if not isinstance(d, six.binary_type):
+            d = d.encode("utf-8")
         m.update(d)
         req.state['headers']['ETag'] = m.hexdigest()
     else:
         raise PipeException("Empty")
 
     req.state['headers']['Content-Type'] = ctype
-    return unicode(d.decode('utf-8')).encode("utf-8")
+    if six.PY2:
+        d = six.u(d)
+    return d
 
 
 @pipe
@@ -1172,7 +1185,7 @@ Useful for testing.
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
-    for fp, pem in xmlsec.crypto.CertDict(req.t).items():
+    for fp, pem in list(xmlsec.crypto.CertDict(req.t).items()):
         log.info("found signing cert with fingerprint %s" % fp)
     return req.t
 
@@ -1216,13 +1229,24 @@ If operating on a single EntityDescriptor then @Name is ignored (cf :py:mod:`pyf
     e = root(req.t)
     if e.tag == "{%s}EntitiesDescriptor" % NS['md']:
         name = req.args.get('name', None)
-        if name is None or not len(name):
+        if name is None or 0 == len(name):
             name = req.args.get('Name', None)
-        if name is None or not len(name):
+        if name is None or 0 == len(name):
             name = req.state.get('url', None)
-        if name is None or not len(name):
+            if name and 'baseURL' in req.args:
+
+                try:
+                    name_url = urlparse(name)
+                    base_url = urlparse(req.args.get('baseURL'))
+                    name = "{}://{}{}".format(base_url.scheme, base_url.netloc, name_url.path)
+                    log.debug("-------- using Name: %s" % name)
+                except ValueError as ex:
+                    log.debug(ex)
+                    name = None
+        if name is None or 0 == len(name):
             name = e.get('Name', None)
-        if name is not None and len(name):
+
+        if name:
             e.set('Name', name)
 
     now = datetime.utcnow()
@@ -1356,5 +1380,39 @@ document for later processing.
         # log.debug("setting %s on %s" % (req.args,e.get('entityID')))
         set_entity_attributes(e, req.args)
         req.store.update(e)
+
+    return req.t
+
+
+@pipe(name='nodecountry')
+def _nodecountry(req, *opts):
+    """
+Sets eidas:NodeCountry
+
+:param req: The request
+:param opts: Options (not used)
+:return: A modified working document
+
+Transforms the working document by setting NodeCountry
+
+**Examples**
+
+.. code-block:: yaml
+
+    - nodecountry:
+        country: XX
+
+Normally this would be combined with the 'merge' feature of fork or in a cleanup pipline to add attributes to
+the working document for later processing.
+    """
+    if req.t is None:
+        raise PipeException("Your pipeline is missing a select statement.")
+
+    for e in iter_entities(req.t):
+        if req.args is not None and 'country' in req.args:
+            set_nodecountry(e, country_code=req.args['country'])
+            req.store.update(e)
+        else:
+            log.error("No country found in arguments to nodecountry")
 
     return req.t

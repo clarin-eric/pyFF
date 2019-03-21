@@ -1,22 +1,23 @@
-
 from six import StringIO
 from copy import deepcopy
 import re
 from redis import Redis
 from .constants import NS, ATTRS, ATTRS_INV
 from .decorators import cached
-from .logs import log
+from .logs import get_log
 from .constants import config
 from .utils import root, dumptree, parse_xml, hex_digest, hash_id, valid_until_ts, \
-    avg_domain_distance, ts_now, load_callable
+    avg_domain_distance, ts_now, load_callable, is_text, b2u
 from .samlmd import EntitySet, iter_entities, entity_attribute_dict, is_sp, is_idp, entity_info, \
-    object_id, find_merge_strategy, find_entity, entity_simple_summary
+    object_id, find_merge_strategy, find_entity, entity_simple_summary, entitiesdescriptor
 from whoosh.fields import Schema, TEXT, ID, KEYWORD, STORED, BOOLEAN
 from whoosh import writing
 from . import merge_strategies
 import ipaddr
 import operator
 import six
+
+log = get_log(__name__)
 
 DINDEX = ('sha1', 'sha256', 'null')
 
@@ -38,9 +39,6 @@ class SAMLStoreBase(object):
             log.debug("**** yield entityID=%s" % e.get('entityID'))
             yield e
 
-    def periodic(self, stats):
-        pass
-
     def size(self, a=None, v=None):
         raise NotImplementedError()
 
@@ -55,6 +53,65 @@ class SAMLStoreBase(object):
 
     def entity_ids(self):
         return set(e.get('entityID') for e in self.lookup('entities'))
+
+    def _select(self, member=None):
+        if member is None:
+            member = "entities"
+
+        if is_text(member):
+            if '!' in member:
+                (src, xp) = member.split("!")
+                if len(src) == 0:
+                    src = None
+                return self.select(src, xp=xp)
+
+        log.debug("calling store lookup %s" % member)
+        return self.lookup(member)
+
+    def select(self, member, xp=None):
+        """
+        Select a set of metadata elements and return an EntityDescriptor with the result of the select.
+
+        :param member: A selector (cf below)
+        :type member: basestring
+        :param xp: An optional xpath filter
+        :type xp: basestring
+        :return: An interable of EntityDescriptor elements
+        :rtype: etree.Element
+
+
+        **Selector Syntax**
+
+            - selector "+" selector
+            - [sourceID] "!" xpath
+            - attribute=value or {attribute}value
+            - entityID
+            - source (typically @Name from an EntitiesDescriptor set but could also be an alias)
+
+        The first form results in the intersection of the results of doing a lookup on the selectors. The second form
+        results in the EntityDescriptor elements from the source (defaults to all EntityDescriptors) that match the
+        xpath expression. The attribute-value forms resuls in the EntityDescriptors that contain the specified entity
+        attribute pair. If non of these forms apply, the lookup is done using either source ID (normally @Name from
+        the EntitiesDescriptor) or the entityID of single EntityDescriptors. If member is a URI but isn't part of
+        the metadata repository then it is fetched an treated as a list of (one per line) of selectors. If all else
+        fails an empty list is returned.
+        """
+        l = self._select(member)
+        if hasattr(l, 'tag'):
+            l = [l]
+        elif hasattr(l, '__iter__'):
+            l = list(l)
+
+        if xp is None:
+            return l
+        else:
+            log.debug("filtering %d entities using xpath %s" % (len(l), xp))
+            t = entitiesdescriptor(l, 'dummy', lookup_fn=self.lookup)
+            if t is None:
+                return []
+            l = root(t).xpath(xp, namespaces=NS, smart_strings=False)
+            log.debug("got %d entities after filtering" % len(l))
+            return l
 
     def merge(self, t, nt, strategy=merge_strategies.replace_existing, strategy_name=None):
         """
@@ -110,7 +167,7 @@ The dict in the list contains three items:
 
         match_query = bool(len(query) > 0)
 
-        if isinstance(query, basestring):
+        if isinstance(query, six.string_types):
             query = [query.lower()]
 
         def _strings(elt):
@@ -123,7 +180,7 @@ The dict in the list contains three items:
                          '{%s}Scope' % NS['shibmd']]:
                 lst.extend([s.text for s in elt.iter(attr)])
             lst.append(elt.get('entityID'))
-            return filter(lambda item: item is not None, lst)
+            return [item for item in lst if item is not None]
 
         def _ip_networks(elt):
             return [ipaddr.IPNetwork(x.text) for x in elt.iter('{%s}IPHint' % NS['mdui'])]
@@ -193,6 +250,39 @@ The dict in the list contains three items:
             return res
 
 
+class EmptyStore(SAMLStoreBase):
+
+    def lookup(self, key):
+        return list()
+
+    def __init__(self):
+        pass
+
+    def update(self, **kwargs):
+        return 0
+
+    def size(self, **kwargs):
+        return 0
+
+    def collections(self):
+        return []
+
+    def reset(self):
+        pass
+
+    def entity_ids(self):
+        return set()
+
+    def select(self, **kwargs):
+        return list()
+
+    def search(self, **kwargs):
+        return list()
+
+    def merge(self, *args, **kwargs):
+        return list()
+
+
 class WhooshStore(SAMLStoreBase):
 
     def __init__(self):
@@ -203,7 +293,7 @@ class WhooshStore(SAMLStoreBase):
                              keywords=KEYWORD())
         self.schema.add("object_id", ID(stored=True, unique=True))
         self.schema.add("entity_id", ID(stored=True, unique=True))
-        for a in ATTRS.keys():
+        for a in list(ATTRS.keys()):
             self.schema.add(a, KEYWORD())
         self._collections = set()
         from whoosh.filedb.filestore import RamStorage, FileStorage
@@ -223,20 +313,20 @@ class WhooshStore(SAMLStoreBase):
 
     def _index_prep(self, info):
         if 'entity_attributes' in info:
-            for a,v in info.pop('entity_attributes').items():
+            for a, v in list(info.pop('entity_attributes').items()):
                 info[a] = v
-        for a,v in info.items():
+        for a, v in list(info.items()):
             if type(v) is not list and type(v) is not tuple:
-               info[a] = [info.pop(a)]
+                info[a] = [info.pop(a)]
 
             if a in ATTRS_INV:
                 info[ATTRS_INV[a]] = info.pop(a)
 
-        for a in info.keys():
-            if not a in self.schema.names():
+        for a in list(info.keys()):
+            if a not in self.schema.names():
                 del info[a]
 
-        for a,v in info.items():
+        for a, v in list(info.items()):
             info[a] = [six.text_type(vv) for vv in v]
 
     def _index(self, e, tid=None):
@@ -272,53 +362,53 @@ class WhooshStore(SAMLStoreBase):
         return ne
 
     def collections(self):
-        return self._collections
+        return b2u(self._collections)
 
     def reset(self):
         self.__init__()
 
     def size(self, a=None, v=None):
         if a is None:
-            return len(self.objects.keys())
+            return len(list(self.objects.keys()))
         elif a is not None and v is None:
             return len(self.attribute(a))
         else:
-            return len(self.lookup("{!s}={!s}".format(a,v)))
+            return len(self.lookup("{!s}={!s}".format(a, v)))
 
     def _attributes(self):
         ix = self.storage.open_index()
         with ix.reader() as reader:
             for n in reader.indexed_field_names():
                 if n in ATTRS:
-                    yield ATTRS[n]
+                    yield b2u(ATTRS[n])
 
     def attributes(self):
-        return list(self._attributes())
+        return b2u(list(self._attributes()))
 
     def attribute(self, a):
         if a in ATTRS_INV:
             n = ATTRS_INV[a]
             ix = self.storage.open_index()
             with ix.searcher() as searcher:
-                return list(searcher.lexicon(n))
+                return b2u(list(searcher.lexicon(n)))
         else:
             return []
 
     def lookup(self, key, raw=True, field="entity_id"):
         if key == 'entities' or key is None:
             if raw:
-                return self.objects.values()
+                return b2u(list(self.objects.values()))
             else:
-                return self.infos.values()
+                return b2u(list(self.infos.values()))
 
         from whoosh.qparser import QueryParser
-        #import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         key = key.strip('+')
         key = key.replace('+', ' AND ')
-        for uri,a in ATTRS_INV.items():
-            key = key.replace(uri,a)
+        for uri, a in list(ATTRS_INV.items()):
+            key = key.replace(uri, a)
         key = " {!s} ".format(key)
-        key = re.sub("([^=]+)=(\S+)","\\1:\\2",key)
+        key = re.sub("([^=]+)=(\S+)", "\\1:\\2", key)
         key = re.sub("{([^}]+)}(\S+)", "\\1:\\2", key)
         key = key.strip()
 
@@ -326,14 +416,14 @@ class WhooshStore(SAMLStoreBase):
         q = qp.parse(key)
         lst = set()
         with self.index.searcher() as searcher:
-            results = searcher.search(q,limit=None)
+            results = searcher.search(q, limit=None)
             for result in results:
                 if raw:
                     lst.add(self.objects[result['object_id']])
                 else:
                     lst.add(self.infos[result['object_id']])
 
-        return list(lst)
+        return b2u(list(lst))
 
 
 class MemoryStore(SAMLStoreBase):
@@ -356,15 +446,15 @@ class MemoryStore(SAMLStoreBase):
         if a is None:
             return len(self.entities)
         elif a is not None and v is None:
-            return len(self.index.setdefault('attr', {}).setdefault(a, {}).keys())
+            return len(list(self.index.setdefault('attr', {}).setdefault(a, {}).keys()))
         else:
             return len(self.index.setdefault('attr', {}).setdefault(a, {}).get(v, []))
 
     def attributes(self):
-        return self.index.setdefault('attr', {}).keys()
+        return list(self.index.setdefault('attr', {}).keys())
 
     def attribute(self, a):
-        return self.index.setdefault('attr', {}).setdefault(a, {}).keys()
+        return list(self.index.setdefault('attr', {}).setdefault(a, {}).keys())
 
     def _modify(self, entity, modifier):
 
@@ -375,7 +465,7 @@ class MemoryStore(SAMLStoreBase):
             _m(self.index[hn], hash_id(entity, hn, False))
 
         attr_idx = self.index.setdefault('attr', {})
-        for attr, values in entity_attribute_dict(entity).items():
+        for attr, values in list(entity_attribute_dict(entity).items()):
             vidx = attr_idx.setdefault(attr, {})
             for v in values:
                 _m(vidx, v)
@@ -403,7 +493,7 @@ class MemoryStore(SAMLStoreBase):
             else:
                 m = re.compile(v)
                 entities = []
-                for value, ents in idx.items():
+                for value, ents in list(idx.items()):
                     if m.match(value):
                         entities.extend(ents)
                 return entities
@@ -412,10 +502,10 @@ class MemoryStore(SAMLStoreBase):
         self.__init__()
 
     def collections(self):
-        return self.md.keys()
+        return list(self.md.keys())
 
     def update(self, t, tid=None, ts=None, merge_strategy=None):
-        # log.debug("memory store update: %s: %s" % (repr(t), tid))
+        #log.debug("memory store update: %s: %s" % (repr(t), tid))
         relt = root(t)
         assert (relt is not None)
         ne = 0
@@ -441,12 +531,12 @@ class MemoryStore(SAMLStoreBase):
         return ne
 
     def lookup(self, key):
-        # log.debug("memory store lookup: %s" % key)
+        #log.debug("memory store lookup: %s" % key)
         return self._lookup(key)
 
     def _lookup(self, key):
         if key == 'entities' or key is None:
-            return self.entities.values()
+            return list(self.entities.values())
         if '+' in key:
             key = key.strip('+')
             # log.debug("lookup intersection of '%s'" % ' and '.join(key.split('+')))
@@ -460,7 +550,7 @@ class MemoryStore(SAMLStoreBase):
                     hits.intersection_update(other)
 
                 if not hits:
-                    log.debug("empty intersection")
+                    #log.debug("empty intersection")
                     return []
 
             if hits is not None and hits:
@@ -480,23 +570,26 @@ class MemoryStore(SAMLStoreBase):
                 res.update(self._get_index(m.group(1), v))
             return list(res)
 
-        l = self._get_index("null", key)
-        if l:
-            return list(l)
+        if key in self.entities:
+            return [self.entities[key]]
 
         if key in self.md:
-            # log.debug("entities list %s: %s" % (key, self.md[key]))
+            log.debug("entities list %s: %d" % (key, len(self.md[key])))
             lst = []
             for entityID in self.md[key]:
                 lst.extend(self.lookup(entityID))
+            log.debug("returning {} entities".format(len(lst)))
             return lst
 
         return []
 
 
 class RedisStore(SAMLStoreBase):
+    from .decorators import deprecated
+
+    @deprecated(reason="The RedisStore has seen almost no use and is not able to track API changes")
     def __init__(self, version=ts_now(), default_ttl=3600 * 24 * 4, respect_validity=True):
-        self.rc = Redis()
+        self.rc = Redis(charset="utf-8")
         self.default_ttl = default_ttl
         self.respect_validity = respect_validity
 
@@ -516,14 +609,6 @@ class RedisStore(SAMLStoreBase):
             if not self.rc.zcard(tn) > 0:
                 log.debug("dropping empty %s %s" % (attr, c))
                 self.rc.srem(an, c)
-
-    def periodic(self, stats):
-        now = ts_now()
-        stats['Last Periodic Maintenance'] = now
-        log.debug("periodic maintentance...")
-        self.rc.zremrangebyscore("members", "-inf", now)
-        self._drop_empty_av("collections", "members", now)
-        self._drop_empty_av("attributes", "values", now)
 
     def update_entity(self, relt, t, tid, ts, p=None):
         if p is None:
@@ -546,16 +631,16 @@ class RedisStore(SAMLStoreBase):
         p.sadd("#collections", gid)
 
     def attributes(self):
-        return self.rc.smembers("#attributes")
+        return b2u(self.rc.smembers("#attributes"))
 
     def attribute(self, an):
-        return self.rc.zrangebyscore("%s#values" % an, ts_now(), "+inf")
+        return b2u(self.rc.zrangebyscore("%s#values" % an, ts_now(), "+inf"))
 
     def collections(self):
-        return self.rc.smembers("#collections")
+        return b2u(self.rc.smembers("#collections"))
 
     def update(self, t, tid=None, ts=None, merge_strategy=None):  # TODO: merge ?
-        log.debug("redis store update: %s: %s" % (t, tid))
+        #log.debug("redis store update: %s: %s" % (t, tid))
         relt = root(t)
         ne = 0
         if ts is None:
@@ -568,7 +653,7 @@ class RedisStore(SAMLStoreBase):
                 entity_id = relt.get("entityID")
                 if entity_id is not None:
                     self.membership("entities", entity_id, ts, p)
-                for ea, eav in entity_attribute_dict(relt).items():
+                for ea, eav in list(entity_attribute_dict(relt).items()):
                     for v in eav:
                         # log.debug("%s=%s" % (ea, v))
                         self.membership("{%s}%s" % (ea, v), tid, ts, p)
@@ -609,16 +694,19 @@ class RedisStore(SAMLStoreBase):
 
     @cached(ttl=30)
     def _get_metadata(self, key):
-        return root(parse_xml(StringIO(self.rc.get("%s#metadata" % key))))
+        return root(parse_xml(six.BytesIO(self.rc.get("%s#metadata" % key))))
 
     def lookup(self, key):
         log.debug("redis store lookup: %s" % key)
+        if isinstance(key, six.binary_type):
+            key = key.decode("utf-8")
+
         if '+' in key:
             hk = hex_digest(key)
             if not self.rc.exists("%s#members" % hk):
                 self.rc.zinterstore("%s#members" % hk, ["%s#members" % k for k in key.split('+')], 'min')
                 self.rc.expire("%s#members" % hk, 30)  # XXX bad juju - only to keep clients from hammering
-            return self.lookup(hk)
+            return b2u(self.lookup(hk))
 
         m = re.match("^(.+)=(.+)$", key)
         if m:
@@ -631,13 +719,13 @@ class RedisStore(SAMLStoreBase):
                 self.rc.zunionstore("%s#members" % hk,
                                     ["{%s}%s#members" % (m.group(1), v) for v in str(m.group(2)).split(';')], 'min')
                 self.rc.expire("%s#members" % hk, 30)  # XXX bad juju - only to keep clients from hammering
-            return self.lookup(hk)
+            return b2u(self.lookup(hk))
         elif self.rc.exists("%s#alias" % key):
-            return self.lookup(self.rc.get("%s#alias" % key))
+            return b2u(self.lookup(self.rc.get("%s#alias" % key)))
         elif self.rc.exists("%s#metadata" % key):
-            return [self._get_metadata(key)]
+            return [b2u(self._get_metadata(key))]
         else:
-            return self._members(key)
+            return b2u(self._members(key))
 
     def size(self):
         return self.rc.zcount("entities#members", ts_now(), "+inf")

@@ -1,7 +1,11 @@
+mako
+six
 redis
+urllib3
+idna
 ipaddr
 publicsuffix
-lxml==4.1.1
+lxml
 cherrypy
 sphinx-pypi-upload
 sphinx
@@ -18,3 +22,4 @@ pyyaml
 multiprocess
 requests_cache
 requests_file
+whoosh

@@ -45,6 +45,7 @@ class TestRedisStore(TestCase):
     def test_store_attributes_test01(self):
         store = self._redis_store()
         store.update(self.test01)
+        print(store.attributes())
         assert (ATTRS['domain'] in store.attributes())
         assert (ATTRS['role'] in store.attributes())
         assert (ATTRS['collection'] not in store.attributes())
@@ -89,14 +90,13 @@ class TestRedisStore(TestCase):
         entity_id = root(self.test01).get('entityID')
         assert (entity_id is not None)
         d = dict()
-        store.periodic(d)
-        assert('Last Periodic Maintenance' in d)
 
     def test_load_swamid(self):
         store = self._redis_store()
         store.update(self.swamid)
         assert (store.size() == 990)
         assert (len(store.lookup("{%s}idp" % ATTRS['role'])) == 534)
+
 
 class TestWhooshStore(TestCase):
     def setUp(self):
@@ -129,6 +129,7 @@ class TestWhooshStore(TestCase):
     def test_store_attributes_test01(self):
         store = WhooshStore()
         store.update(self.test01)
+        print(store.attributes())
         assert (ATTRS['domain'] in store.attributes())
         assert (ATTRS['role'] in store.attributes())
         assert (ATTRS['collection'] not in store.attributes())
@@ -156,7 +157,7 @@ class TestWhooshStore(TestCase):
         store = WhooshStore()
         store.update(self.test01)
         entity_id = root(self.test01).get('entityID')
-        e = store.lookup("%s=%s+%s=%s" % (ATTRS['domain'], u'example.com', ATTRS['role'], u'idp'))
+        e = store.lookup("%s=%s+%s=%s" % (ATTRS['domain'], 'example.com', ATTRS['role'], 'idp'))
         assert (len(e) == 1)
         assert (e[0] is not None)
         assert (e[0].get('entityID') is not None)

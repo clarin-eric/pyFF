@@ -4,11 +4,12 @@ transform, sign or output SAML metadata.
 """
 
 import traceback
-from six import StringIO
 import os
 import yaml
-from .utils import resource_string, PyffException
-from .logs import log
+from .utils import resource_string, PyffException, is_text
+from .logs import get_log
+
+log = get_log(__name__)
 
 __author__ = 'leifj'
 
@@ -80,14 +81,14 @@ def load_pipe(d):
     name = None
     args = None
     opts = []
-    if type(d) is str or type(d) is unicode:
+    if is_text(d):
         name, opts = _n(d)
     elif hasattr(d, '__iter__') and not type(d) is dict:
         if not len(d):
             raise PipeException("This does not look like a length of pipe... \n%s" % repr(d))
         name, opts = _n(d[0])
     elif type(d) is dict:
-        k = d.keys()[0]
+        k = list(d.keys())[0]
         name, opts = _n(k)
         args = d[k]
     else:
@@ -117,15 +118,25 @@ A delayed pipeline callback used as a post for parse_saml_metadata
         self.req = req
         self.store = store
 
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
     def __call__(self, *args, **kwargs):
         log.debug("{!s}: called".format(self.plumbing))
         t = args[0]
         if t is None:
             raise ValueError("PipelineCallback must be called with a parse-tree argument")
         try:
-            return self.plumbing.process(self.req.md, args=kwargs, store=self.store, state={self.entry_point: True}, t=t)
+            state = kwargs
+            state[self.entry_point] = True
+            log.debug("********* {}".format(repr(state)))
+            return self.plumbing.process(self.req.md, store=self.store, state=state, t=t)
         except Exception as ex:
-            traceback.print_exc(ex)
+            log.debug(traceback.format_exc())
+            log.error(ex)
             raise ex
 
 
@@ -196,9 +207,6 @@ may modify any of the fields.
             self.done = False
             self._store = store
 
-        def lookup(self, member):
-            return self.md.lookup(member, store=self.store)
-
         @property
         def store(self):
             if self._store:
@@ -213,7 +221,7 @@ may modify any of the fields.
             for p in pl.pipeline:
                 cb, opts, name, args = load_pipe(p)
                 log.debug("{!s}: calling '{}' using args: {} and opts: {}".format(pl, name, repr(args), repr(opts)))
-                if type(args) is str or type(args) is unicode:
+                if is_text(args):
                     args = [args]
                 if args is not None and type(args) is not dict and type(args) is not list and type(args) is not tuple:
                     raise PipeException("Unknown argument type %s" % repr(args))
@@ -235,6 +243,7 @@ The main entrypoint for processing a request pipeline. Calls the inner processor
 :param state: The active request state
 :param t: The active working document
 :param store: The store object to operate on
+:param args: Pipeline arguments
 :return: The result of applying the processing pipeline to t.
         """
         if not state:
@@ -252,7 +261,7 @@ The main entrypoint for processing a request pipeline. Calls the inner processor
             try:
                 pipefn, opts, name, args = load_pipe(p)
                 # log.debug("traversing pipe %s,%s,%s using %s" % (pipe,name,args,opts))
-                if type(args) is str or type(args) is unicode:
+                if is_text(args):
                     args = [args]
                 if args is not None and type(args) is not dict and type(args) is not list and type(args) is not tuple:
                     raise PipeException("Unknown argument type %s" % repr(args))
@@ -264,6 +273,7 @@ The main entrypoint for processing a request pipeline. Calls the inner processor
                 if req.done:
                     break
             except PipeException as ex:
+                log.debug(traceback.format_exc())
                 log.error(ex)
                 break
         return req.t

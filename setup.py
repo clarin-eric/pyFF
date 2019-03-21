@@ -16,14 +16,19 @@ README = open(join(here, 'README.rst')).read()
 NEWS = open(join(here, 'NEWS.txt')).read()
 
 install_requires = [
-    'lxml==4.1.1',
+    'mako',
+    'six',
+    'urllib3',
+    'idna',
+    'lxml >=4.1.1',
     'pyyaml >=3.10',
     'pyXMLSecurity >=0.15',
-    'cherrypy >=3.2.0',
+    'cherrypy',
     'iso8601 >=0.1.4',
     'simplejson >=2.6.2',
     'jinja2',
     'httplib2 >=0.7.7',
+    'six>=1.11.0',
     'ipaddr',
     'publicsuffix',
     'redis',
@@ -34,17 +39,12 @@ install_requires = [
     'pyconfig',
     'pyyaml',
     'multiprocess',
-    'minify'
+    'minify',
+    'whoosh'
 ]
 
 python_implementation_str = python_implementation()
 
-if not (python_implementation_str == 'CPython' and version_info.major == 2 and (version_info.minor == 6 or version_info.minor == 7)):
-    raise RuntimeError('ERROR: running under unsupported {python_implementation_str:s} version '
-                       '{major_version:d}.{minor_version:d}. Please consult the documentation for supported platforms. '
-                       .format(python_implementation_str=python_implementation_str,
-                               major_version=version_info.major,
-                               minor_version=version_info.minor))
 setup(name='pyFF',
       version=__version__,
       description="Federation Feeder",

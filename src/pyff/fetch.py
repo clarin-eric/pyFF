@@ -4,23 +4,34 @@ An abstraction layer for metadata fetchers. Supports both syncronous and asyncro
 
 """
 
-from __future__ import absolute_import, unicode_literals
-from .logs import log
+from .logs import get_log
 import os
 import requests
 from .constants import config
 from datetime import datetime
 from collections import deque
-from UserDict import DictMixin
+import six
 from concurrent import futures
+import traceback
 from .parse import parse_resource
 from itertools import chain
 from .exceptions import ResourceException
 from .utils import url_get
+from copy import deepcopy, copy
+
+if six.PY2:
+    from UserDict import DictMixin as ResourceManagerBase
+elif six.PY3:
+    from collections import MutableMapping as ResourceManagerBase
+
 
 requests.packages.urllib3.disable_warnings()
 
-class ResourceManager(DictMixin):
+log = get_log(__name__)
+
+
+class ResourceManager(ResourceManagerBase):
+
     def __init__(self):
         self._resources = dict()
         self.shutdown = False
@@ -38,16 +49,16 @@ class ResourceManager(DictMixin):
             del self._resources[key]
 
     def keys(self):
-        return self._resources.keys()
+        return list(self._resources.keys())
 
     def values(self):
-        return self._resources.values()
+        return list(self._resources.values())
 
     def walk(self, url=None):
         if url is not None:
             return self[url].walk()
         else:
-            i = [r.walk() for r in self.values()]
+            i = [r.walk() for r in list(self.values())]
             return chain(*i)
 
     def add(self, r):
@@ -58,12 +69,18 @@ class ResourceManager(DictMixin):
     def __contains__(self, item):
         return item in self._resources
 
+    def __len__(self):
+        return len(list(self.values()))
+
+    def __iter__(self):
+        return self.walk()
+
     def reload(self, url=None, fail_on_error=False, store=None):
         # type: (object, basestring) -> None
         if url is not None:
             resources = deque([self[url]])
         else:
-            resources = deque(self.values())
+            resources = deque(list(self.values()))
 
         with futures.ThreadPoolExecutor(max_workers=config.worker_pool_size) as executor:
             while resources:
@@ -77,7 +94,8 @@ class ResourceManager(DictMixin):
                             for nr in res:
                                 new_resources.append(nr)
                     except Exception as ex:
-                        log.error(str(ex))
+                        log.debug(traceback.format_exc())
+                        log.error(ex)
                         if fail_on_error:
                             raise ex
                 resources = new_resources
@@ -97,8 +115,8 @@ class Resource(object):
         def _null(t):
             return t
 
-        self.opts.setdefault('cleanup', _null)
-        self.opts.setdefault('via', _null)
+        self.opts.setdefault('cleanup', [])
+        self.opts.setdefault('via', [])
         self.opts.setdefault('fail_on_error', False)
         self.opts.setdefault('as', None)
         self.opts.setdefault('verify', None)
@@ -113,13 +131,16 @@ class Resource(object):
     def post(self):
         return self.opts['via']
 
+    def add_via(self, callback):
+        self.opts['via'].append(callback)
+
     @property
     def cleanup(self):
         return self.opts['cleanup']
 
     def __str__(self):
         return "Resource {} expires at {} using ".format(self.url, self.expire_time) + \
-               ",".join(["{}={}".format(k, v) for k, v in self.opts.items()])
+               ",".join(["{}={}".format(k, v) for k, v in list(self.opts.items())])
 
     def walk(self):
         yield self
@@ -138,11 +159,12 @@ class Resource(object):
         self._infos.append(info)
 
     def add_child(self, url, **kwargs):
-        opts = dict()
-        opts.update(self.opts)
+        opts = deepcopy(self.opts)
         del opts['as']
         opts.update(kwargs)
-        self.children.append(Resource(url, **opts))
+        r = Resource(url, **opts)
+        self.children.append(r)
+        return r
 
     @property
     def name(self):
@@ -189,16 +211,18 @@ class Resource(object):
 
         if self.t is not None:
             self.last_seen = datetime.now()
-            if self.post is not None:
-                self.t = self.post(self.t, **self.opts)
+            if self.post and isinstance(self.post, list):
+                for cb in self.post:
+                    if self.t is not None:
+                        self.t = cb(self.t, **self.opts)
 
             if self.is_expired():
                 info['Expired'] = True
-                raise ResourceException("Resource at {} expired on {}".format(self.url,self.expire_time))
+                raise ResourceException("Resource at {} expired on {}".format(self.url, self.expire_time))
             else:
                 info['Expired'] = False
 
-            for (eid, error) in info['Validation Errors'].items():
+            for (eid, error) in list(info['Validation Errors'].items()):
                 log.error(error)
 
             if store is not None:

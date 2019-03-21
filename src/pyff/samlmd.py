@@ -1,18 +1,24 @@
-from __future__ import absolute_import, unicode_literals
 from datetime import datetime
 from .utils import parse_xml, check_signature, root, validate_document, xml_error, \
     schema, iso2datetime, duration2timedelta, filter_lang, url2host, trunc_str, subdomains, \
-    has_tag, hash_id, load_callable, rreplace, dumptree, first_text, url_get, img_to_data
-from .logs import log
-from .constants import config, NS, ATTRS, NF_URI, PLACEHOLDER_ICON
+    has_tag, hash_id, load_callable, rreplace, dumptree, first_text, url_get, img_to_data, is_text, unicode_stream, \
+    Lambda
+from .logs import get_log
+from .constants import config, NS, ATTRS, NF_URI
 from lxml import etree
 from lxml.builder import ElementMaker
 from lxml.etree import DocumentInvalid
 from itertools import chain
 from copy import deepcopy
 from .exceptions import *
-from six import StringIO
-from requests import ConnectionError
+import traceback
+from distutils.util import strtobool
+from .fetch import ResourceManager
+from .parse import add_parser
+from xmlsec.crypto import CertDict
+from concurrent import futures
+
+log = get_log(__name__)
 
 
 class EntitySet(object):
@@ -31,14 +37,14 @@ class EntitySet(object):
             del self._e[entity_id]
 
     def __iter__(self):
-        for e in self._e.values():
+        for e in list(self._e.values()):
             yield e
 
     def __len__(self):
-        return len(self._e.keys())
+        return len(list(self._e.keys()))
 
     def __contains__(self, item):
-        return item.get('entityID') in self._e.keys()
+        return item.get('entityID') in list(self._e.keys())
 
 
 def find_merge_strategy(strategy_name):
@@ -66,7 +72,7 @@ def parse_saml_metadata(source,
 :param filter_invalid: (default True) remove invalid EntityDescriptor elements rather than raise an errror
 :param validate: (default: True) set to False to turn off all XML schema validation
 :param validation_errors: A dict that will be used to return validation errors to the caller
-:param cleanup: A callable that can be used to pre-process parsed metadata before validation. Use as a clue-bat.
+:param cleanup: A list of callables that can be used to pre-process parsed metadata before validation. Use as a clue-bat.
 (but after xinclude processing and signature validation)
     """
 
@@ -81,8 +87,9 @@ def parse_saml_metadata(source,
 
         t = check_signature(t, key)
 
-        if cleanup is not None:
-            t = cleanup(t)
+        if cleanup is not None and isinstance(cleanup, list):
+            for cb in cleanup:
+                t = cb(t)
         else:  # at least get rid of ID attribute
             for e in iter_entities(t):
                 if e.get('ID') is not None:
@@ -94,24 +101,27 @@ def parse_saml_metadata(source,
             filter_invalid = False
 
         if validate:
-            if filter_invalid:
-                t = filter_invalids_from_document(t, base_url=base_url, validation_errors=validation_errors)
-            else:  # all or nothing
-                try:
-                    validate_document(t)
-                except DocumentInvalid as ex:
-                    validation_errors[base_url] = xml_error(ex.error_log, m=base_url)
-                    raise MetadataException("schema validation failed: [{}] '{}': {}"
-                                            .format(base_url, source, xml_error(ex.error_log, m=base_url)))
+            t = filter_or_validate(t,
+                                   filter_invalid=filter_invalid,
+                                   base_url=base_url,
+                                   source=source,
+                                   validation_errors=validation_errors)
 
         if t is not None:
             if t.tag == "{%s}EntityDescriptor" % NS['md']:
-                t = entitiesdescriptor([t], base_url, copy=False, validate=True, nsmap=t.nsmap)
+                t = entitiesdescriptor([t],
+                                       base_url,
+                                       copy=False,
+                                       validate=True,
+                                       filter_invalid=filter_invalid,
+                                       nsmap=t.nsmap)
 
     except Exception as ex:
+        log.debug(traceback.format_exc())
+        log.error("Error parsing {}: {}".format(base_url, ex))
         if fail_on_error:
             raise ex
-        log.error(ex)
+
         return None, None
 
     log.debug("returning %d valid entities" % len(list(iter_entities(t))))
@@ -119,7 +129,7 @@ def parse_saml_metadata(source,
     return t, expire_time_offset
 
 
-class SAMLMetadataResourceParser():
+class SAMLMetadataResourceParser:
     def __init__(self):
         pass
 
@@ -129,7 +139,7 @@ class SAMLMetadataResourceParser():
     def parse(self, resource, content):
         info = dict()
         info['Validation Errors'] = dict()
-        t, expire_time_offset = parse_saml_metadata(StringIO(content.encode('utf8')),
+        t, expire_time_offset = parse_saml_metadata(unicode_stream(content),
                                                     key=resource.opts['verify'],
                                                     base_url=resource.url,
                                                     cleanup=resource.opts['cleanup'],
@@ -150,9 +160,68 @@ class SAMLMetadataResourceParser():
         return info
 
 
-from .parse import add_parser
-
 add_parser(SAMLMetadataResourceParser())
+
+
+class MDServiceListParser(object):
+    def __init__(self):
+        pass
+
+    def magic(self, content):
+        return 'MetadataServiceList' in content
+
+    def parse(self, resource, content):
+        info = dict()
+        info['Description'] = "eIDAS MetadataServiceList from {}".format(resource.url)
+        t = parse_xml(unicode_stream(content))
+        t.xinclude()
+        relt = root(t)
+        info['Version'] = relt.get('Version', '0')
+        info['IssueDate'] = relt.get('IssueDate')
+        info['IssuerName'] = first_text(relt, "{%s}IssuerName" % NS['ser'])
+        info['SchemeIdentifier'] = first_text(relt, "{%s}SchemeIdentifier" % NS['ser'])
+        info['SchemeTerritory'] = first_text(relt, "{%s}SchemeTerritory" % NS['ser'])
+        for mdl in relt.iter("{%s}MetadataList" % NS['ser']):
+            for ml in mdl.iter("{%s}MetadataLocation" % NS['ser']):
+                location = ml.get('Location')
+                if location:
+                    certs = CertDict(ml)
+                    fingerprints = list(certs.keys())
+                    fp = None
+                    if len(fingerprints) > 0:
+                        fp = fingerprints[0]
+
+                    ep = ml.find("{%s}Endpoint" % NS['ser'])
+                    if ep is not None and fp is not None:
+                        args = dict(country_code=mdl.get('Territory'),
+                                    hide_from_discovery=strtobool(ep.get('HideFromDiscovery', 'false')))
+                        log.debug("MDSL[{}]: {} verified by {} for country {}".format(info['SchemeTerritory'],
+                                                                                      location,
+                                                                                      fp,
+                                                                                      args.get('country_code')))
+                        r = resource.add_child(location, verify=fp)
+
+                        # this is specific post-processing for MDSL files
+                        def _update_entities(_t, **kwargs):
+                            _country_code = kwargs.get('country_code')
+                            _hide_from_discovery = kwargs.get('hide_from_discovery')
+                            for e in iter_entities(_t):
+                                if _country_code:
+                                    set_nodecountry(e, _country_code)
+                                if bool(_hide_from_discovery) and is_idp(e):
+                                    set_entity_attributes(e, {ATTRS['entity-category']:
+                                                              'http://refeds.org/category/hide-from-discovery'})
+                            return _t
+
+                        r.add_via(Lambda(_update_entities, **args))
+
+        log.debug("Done parsing eIDAS MetadataServiceList")
+        resource.last_seen = datetime.now
+        resource.expire_time = None
+        return info
+
+
+add_parser(MDServiceListParser())
 
 
 def metadata_expiration(t):
@@ -181,12 +250,35 @@ def filter_invalids_from_document(t, base_url, validation_errors):
         if not xsd.validate(e):
             log.debug(etree.tostring(e))
             error = xml_error(xsd.error_log, m=base_url)
-            entity_id = e.get("entityID","(Missing entityID)")
+            entity_id = e.get("entityID", "(Missing entityID)")
             log.warn('removing \'%s\': schema validation failed: %s' % (entity_id, xsd.error_log))
             validation_errors[entity_id] = "{}".format(xsd.error_log)
             if e.getparent() is None:
                 return None
             e.getparent().remove(e)
+    return t
+
+
+def filter_or_validate(t, filter_invalid=False, base_url="", source=None, validation_errors=dict()):
+    log.debug("Filtering invalids from {}".format(base_url))
+    if filter_invalid:
+        t = filter_invalids_from_document(t, base_url=base_url, validation_errors=validation_errors)
+        for entity_id, err in validation_errors.items():
+            log.error("Validation error while parsing {} (from {}). Removed @entityID='{}': {}".format(base_url,
+                                                                                                       source,
+                                                                                                       entity_id,
+                                                                                                       err))
+    else:  # all or nothing
+        log.debug("Validating (one-shot) {}".format(base_url))
+        try:
+            return validate_document(t)
+        except DocumentInvalid as ex:
+            err = xml_error(ex.error_log, m=base_url)
+            validation_errors[base_url] = err
+            raise MetadataException("Validation error while parsing {}: (from {}): {}".format(base_url,
+                                                                                              source,
+                                                                                              err))
+
     return t
 
 
@@ -196,6 +288,7 @@ def entitiesdescriptor(entities,
                        cache_duration=None,
                        valid_until=None,
                        validate=True,
+                       filter_invalid=True,
                        copy=True,
                        nsmap=None):
     """
@@ -206,6 +299,8 @@ def entitiesdescriptor(entities,
 :param valid_until: a relative time eg 2w 4d 1h for 2 weeks, 4 days and 1hour from now.
 :param copy: set to False to avoid making a copy of all the entities in list. This may be dangerous.
 :param validate: set to False to skip schema validation of the resulting EntitiesDesciptor element. This is dangerous!
+:param filter_invalid: remove invalid entitiesdescriptor elements from aggregate
+:param nsmap: additional namespace definitions to include in top level entitiesdescriptor element
 
 Produce an EntityDescriptors set from a list of entities. Optional Name, cacheDuration and validUntil are affixed.
     """
@@ -213,11 +308,11 @@ Produce an EntityDescriptors set from a list of entities. Optional Name, cacheDu
     if nsmap is None:
         nsmap = dict()
 
-    def _resolve(member, l_fn):
-        if hasattr(member, 'tag'):
-            return [member]
+    def _resolve(m, l_fn):
+        if hasattr(m, 'tag'):
+            return [m]
         else:
-            return l_fn(member)
+            return l_fn(m)
 
     nsmap.update(NS)
     resolved_entities = set()
@@ -252,11 +347,16 @@ Produce an EntityDescriptors set from a list of entities. Optional Name, cacheDu
             fd.write(dumptree(t))
 
     if validate:
-        try:
-            validate_document(t)
-        except DocumentInvalid as ex:
-            log.debug(xml_error(ex.error_log))
-            raise MetadataException("XML schema validation failed: %s" % name)
+        validation_errors = dict()
+        t = filter_or_validate(t,
+                               filter_invalid=filter_invalid,
+                               base_url=name,
+                               source="request",
+                               validation_errors=validation_errors)
+
+        for base_url, err in validation_errors.items():
+            log.error("Validation error: @ {}: {}".format(base_url, err))
+
     return t
 
 
@@ -374,7 +474,7 @@ def with_entity_attributes(entity, cb):
         for a in ea.iter("{%s}Attribute" % NS['saml']):
             an = a.get('Name', None)
             if a is not None:
-                values = filter(lambda x: x is not None, [_stext(v) for v in a.iter("{%s}AttributeValue" % NS['saml'])])
+                values = [x for x in [_stext(v) for v in a.iter("{%s}AttributeValue" % NS['saml'])] if x is not None]
                 cb(an, values)
 
 
@@ -403,7 +503,7 @@ def entity_attributes(entity):
 
 def find_in_document(t, member):
     relt = root(t)
-    if type(member) is str or type(member) is unicode:
+    if is_text(member):
         if '!' in member:
             (src, xp) = member.split("!")
             return relt.xpath(xp, namespaces=NS, smart_strings=False)
@@ -442,6 +542,7 @@ def entity_attribute_dict(entity):
         d[ATTRS['software']] = [guess_entity_software(entity)]
 
     return d
+
 
 def gen_icon(e):
     scopes = entity_scopes(e)
@@ -549,7 +650,47 @@ def entity_scopes(e):
     return [s.text for s in elt]
 
 
-def discojson(e, langs=None):
+def discojson_load_icon(d, fallback_to_favicon=False):
+    try:
+        if 'entity_icon_url' in d:
+            icon_info = d['entity_icon_url']
+        else:
+            icon_info = {}
+        urls = []
+        if icon_info and 'url' in icon_info:
+            url = icon_info['url']
+            urls.append(url)
+
+            if 'scope' in d and fallback_to_favicon:
+                scopes = d['scope'].split(',')
+                for scope in scopes:
+                    urls.append("https://{}/favico.ico".format(scope))
+                    urls.append("https://www.{}/favico.ico".format(scope))
+                    urls.append("http://{}/favico.ico".format(scope))
+                    urls.append("http://www.{}/favico.ico".format(scope))
+
+        d['entity_icon'] = None
+        for url in urls:
+            if url.startswith("data:"):
+                d['entity_icon'] = url
+                break
+
+            if '://' in url:
+                try:
+                    r = url_get(url)
+                except IOError:
+                    continue
+                if r.ok and r.content:
+                    d['entity_icon'] = img_to_data(r.content, r.headers.get('Content-Type'))
+                    break
+    except Exception as ex:
+        log.debug(traceback.format_exc())
+        log.error(ex)
+
+    return d
+
+
+def discojson(e, langs=None, fallback_to_favicon=False, load_icon=True):
     if e is None:
         return dict()
 
@@ -571,35 +712,17 @@ def discojson(e, langs=None):
         d['type'] = 'sp'
 
     scopes = entity_scopes(e)
-    icon_info = entity_icon_url(e)
-    urls = []
-    if icon_info is not None and 'url' in icon_info:
-        url = icon_info['url']
-        urls.append(url)
-        if scopes is not None and len(scopes) == 1:
-            urls.append("https://{}/favico.ico".format(scopes[0]))
-            urls.append("https://www.{}/favico.ico".format(scopes[0]))
-
-    d['entity_icon'] = None
-    for url in urls:
-        if url.startswith("data:"):
-            d['entity_icon'] = url
-            break
-
-        if '://' in url:
-            try:
-                r = url_get(url)
-            except ConnectionError:
-                continue
-            if r.ok and r.content:
-                d['entity_icon'] = img_to_data(r.content, r.headers.get('Content-Type'))
-                break
-
     if scopes is not None and len(scopes) > 0:
         d['scope'] = ",".join(scopes)
         if len(scopes) == 1:
             d['domain'] = scopes[0]
             d['name_tag'] = (scopes[0].split('.'))[0].upper()
+
+    icon_info = entity_icon_url(e)
+    d['entity_icon_url'] = entity_icon_url(e)
+
+    if load_icon:
+        discojson_load_icon(d, fallback_to_favicon=fallback_to_favicon)
 
     keywords = filter_lang(e.iter("{%s}Keywords" % NS['mdui']), langs=langs)
     if keywords is not None:
@@ -614,6 +737,12 @@ def discojson(e, langs=None):
         d['geo'] = geo
 
     return d
+
+
+def discojson_t(t):
+    lst = [discojson(en, load_icon=False) for en in iter_entities(t)]
+    with futures.ThreadPoolExecutor(max_workers=config.worker_pool_size) as executor:
+        return list(executor.map(discojson_load_icon, lst))
 
 
 def sha1_id(e):
@@ -642,6 +771,7 @@ def entity_simple_summary(e):
         d['privacy_statement_url'] = psu
 
     return d
+
 
 def entity_orgurl(entity, langs=None):
     for organizationUrl in filter_lang(entity.iter("{%s}OrganizationURL" % NS['md']), langs=langs):
@@ -855,7 +985,7 @@ def set_reginfo(e, policy=None, authority=None):
     ext = entity_extensions(e)
     ri = ext.find(".//{%s}RegistrationInfo" % NS['mdrpi'])
     if ri is not None:
-        raise MetadataException("A RegistrationInfo element is already present")
+        ext.remove(ri)
 
     ri = etree.Element("{%s}RegistrationInfo" % NS['mdrpi'])
     ext.append(ri)
@@ -895,6 +1025,7 @@ Entities where no value exists for the given 'sxp' are sorted last.
 :param t: An element tree containing the entities to sort
 :param sxp: xpath expression selecting the value used for sorting the entities
 """
+
     def get_key(e):
         eid = e.attrib.get('entityID')
         sv = None
@@ -917,3 +1048,108 @@ Entities where no value exists for the given 'sxp' are sorted last.
 
     container = root(t)
     container[:] = sorted(container, key=lambda e: get_key(e))
+
+
+class MDRepository():
+    """A class representing a set of SAML metadata and the resources from where this metadata was loaded.
+    """
+
+    def __init__(self):
+        self.rm = ResourceManager()
+        self.store = None
+
+    def _lookup(self, member, store=None):
+        if store is None:
+            store = self.store
+
+        if member is None:
+            member = "entities"
+
+        if is_text(member):
+            if '!' in member:
+                (src, xp) = member.split("!")
+                if len(src) == 0:
+                    src = None
+                return self.lookup(src, xp=xp, store=store)
+
+        log.debug("calling store lookup %s" % member)
+        return store.lookup(member)
+
+    def lookup(self, member, xp=None, store=None):
+        """
+Lookup elements in the working metadata repository
+
+:param member: A selector (cf below)
+:type member: basestring
+:param xp: An optional xpath filter
+:type xp: basestring
+:param store: the store to operate on
+:return: An interable of EntityDescriptor elements
+:rtype: etree.Element
+
+
+**Selector Syntax**
+
+    - selector "+" selector
+    - [sourceID] "!" xpath
+    - attribute=value or {attribute}value
+    - entityID
+    - source (typically @Name from an EntitiesDescriptor set but could also be an alias)
+
+The first form results in the intersection of the results of doing a lookup on the selectors. The second form
+results in the EntityDescriptor elements from the source (defaults to all EntityDescriptors) that match the
+xpath expression. The attribute-value forms resuls in the EntityDescriptors that contain the specified entity
+attribute pair. If non of these forms apply, the lookup is done using either source ID (normally @Name from
+the EntitiesDescriptor) or the entityID of single EntityDescriptors. If member is a URI but isn't part of
+the metadata repository then it is fetched an treated as a list of (one per line) of selectors. If all else
+fails an empty list is returned.
+
+        """
+        if store is None:
+            store = self.store
+
+        l = self._lookup(member, store=store)
+        if hasattr(l, 'tag'):
+            l = [l]
+        elif hasattr(l, '__iter__'):
+            l = list(l)
+
+        if xp is None:
+            return l
+        else:
+            log.debug("filtering %d entities using xpath %s" % (len(l), xp))
+            t = entitiesdescriptor(l, 'dummy', lookup_fn=self.lookup)
+            if t is None:
+                return []
+            l = root(t).xpath(xp, namespaces=NS, smart_strings=False)
+            log.debug("got %d entities after filtering" % len(l))
+            return l
+
+
+def set_nodecountry(e, country_code):
+    """Set eidas:NodeCountry on an EntityDescriptor
+
+:param e: The EntityDescriptor element
+:param country_code: An ISO country code
+:raise: MetadataException unless e is an EntityDescriptor element
+    """
+    if e.tag != "{%s}EntityDescriptor" % NS['md']:
+        raise MetadataException("I can only add NodeCountry to EntityDescriptor elements")
+
+    def _set_nodecountry_in_ext(ext_elt, iso_cc):
+        nc_elt = ext_elt.find("./{%s}NodeCountry" % NS['eidas'])
+        if ext_elt is not None and nc_elt is None:
+            velt = etree.Element("{%s}NodeCountry" % NS['eidas'])
+            velt.text = iso_cc
+            ext_elt.append(velt)
+
+    ext = None
+    idp = e.find("./{%s}IDPSSODescriptor" % NS['md'])
+    if idp is not None and len(idp) > 0:
+        ext = entity_extensions(idp)
+        _set_nodecountry_in_ext(ext, country_code)
+
+    sp = e.find("./{%s}SPSSODescriptor" % NS['md'])
+    if sp is not None and len(sp) > 0:
+        ext = entity_extensions(sp)
+        _set_nodecountry_in_ext(ext, country_code)
