@@ -22,6 +22,10 @@ python SAML metadata aggregator
 .. image:: https://img.shields.io/pypi/v/pyFF.svg
    :target: https://pypi.python.org/pypi/pyFF
    :alt: PyPI Version
+.. image:: https://readthedocs.org/projects/pyff/badge/
+   :target: https://pyff.readthedocs.org/
+   :alt: Documentation
+   
 
 This is a SAML metadata aggregator written in python. It is based on the model 
 for metadata exchange by Ian Young: http://iay.org.uk/blog/2008/10/metadata_interc.html
@@ -33,13 +37,14 @@ for metadata exchange by Ian Young: http://iay.org.uk/blog/2008/10/metadata_inte
 Features 
 ========
 
-* Pluggable "pipelines" for processing SAML metadata
-* Signature validation and creation
-* Support for using PKCS#11 tokens for signing
-* Certificate expiration checking and reporting
-* Fast parallel fetching of multiple streams
-* Integrated discovery service in part based on RA21.org P3W project
-* Support for eIDAS metadata service list format
+* Fully customizable processing pipelines in yaml.
+* Easy to retrieve, analyze, transform, sign and publish SAML metadata.
+* Operate in batch or online mode using embedded HTTP server.
+* Provide a full MDX implementation.
+* Make use of PKCS#11 tokens and HSMs for key protection.
+* Fully compatible with `thiss.io discovery service <https://thiss.io>`_.
+* Fully compatible with `mdq-browser frontend app <https://github.com/SUNET/mdq-browser>`_.
+
 
 Dependencies
 ============

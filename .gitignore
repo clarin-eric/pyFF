@@ -22,3 +22,6 @@ _site
 profile.out*
 localconfig.py
 *.sqlite
+.whoosh
+
+docs/code
