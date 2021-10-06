@@ -10,9 +10,6 @@ python SAML metadata aggregator
 .. image:: https://img.shields.io/coveralls/IdentityPython/pyFF.svg
    :target: https://coveralls.io/r/leifj/pyFF?branch=master
    :alt: Coverage
-.. image:: https://img.shields.io/requires/github/IdentityPython/pyFF.svg
-   :target: https://requires.io/github/IdentityPython/pyFF/requirements/?branch=master
-   :alt: Requirements Status
 .. image:: https://api.codeclimate.com/v1/badges/133c2c109b680c6868c1/maintainability
    :target: https://codeclimate.com/github/IdentityPython/pyFF/maintainability
    :alt: Maintainability
@@ -30,10 +27,6 @@ python SAML metadata aggregator
 This is a SAML metadata aggregator written in python. It is based on the model 
 for metadata exchange by Ian Young: http://iay.org.uk/blog/2008/10/metadata_interc.html
 
-* http://github.com/IdentityPython/pyFF
-* http://pypi.python.org/pypi/pyFF
-* http://packages.python.org/pyFF
-
 Features 
 ========
 
@@ -45,9 +38,16 @@ Features
 * Fully compatible with `thiss.io discovery service <https://thiss.io>`_.
 * Fully compatible with `mdq-browser frontend app <https://github.com/SUNET/mdq-browser>`_.
 
-
 Dependencies
 ============
 
 * pyXMLSecurity
 * PyKCS11 (optional)
+* pygments
+* gunicorn (for the standalone pyffd server)
+* ... cf requirements.txt
+
+More information
+================
+
+Project homepage: https://pyff.io/

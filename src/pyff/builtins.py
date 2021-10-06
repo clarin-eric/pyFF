@@ -5,31 +5,54 @@ These are the built-in "pipes" - functions that can be used to put together a pr
 import base64
 import hashlib
 import json
+import operator
+import os
+import re
 import sys
 import traceback
 from copy import deepcopy
 from datetime import datetime
 from distutils.util import strtobool
-import operator
-import os
-import re
-import xmlsec
-from iso8601 import iso8601
-from lxml.etree import DocumentInvalid
-from .constants import NS
-from .decorators import deprecated
-from .logs import get_log
-from .pipes import Plumbing, PipeException, PipelineCallback, pipe
-from .utils import total_seconds, dumptree, safe_write, root, with_tree, duration2timedelta, xslt_transform, \
-    validate_document, hash_id
-from .samlmd import sort_entities, iter_entities, annotate_entity, set_entity_attributes, \
-    discojson_t, set_pubinfo, set_reginfo, find_in_document, entitiesdescriptor, set_nodecountry, resolve_entities
-from six.moves.urllib_parse import urlparse
-from .exceptions import MetadataException
-import six
-import ipaddr
-from pyff.pipes import registry
+from typing import Dict, Optional
 
+import ipaddr
+import six
+import xmlsec
+from lxml.etree import DocumentInvalid
+from six.moves.urllib_parse import quote_plus, urlparse
+
+from pyff.constants import NS
+from pyff.decorators import deprecated
+from pyff.exceptions import MetadataException
+from pyff.logs import get_log
+from pyff.pipes import PipeException, PipelineCallback, Plumbing, pipe, registry
+from pyff.samlmd import (
+    annotate_entity,
+    discojson_t,
+    entitiesdescriptor,
+    find_in_document,
+    iter_entities,
+    resolve_entities,
+    set_entity_attributes,
+    set_nodecountry,
+    set_pubinfo,
+    set_reginfo,
+    sort_entities,
+)
+from pyff.utils import (
+    datetime2iso,
+    dumptree,
+    duration2timedelta,
+    hash_id,
+    iso2datetime,
+    root,
+    safe_write,
+    total_seconds,
+    utc_now,
+    validate_document,
+    with_tree,
+    xslt_transform,
+)
 
 __author__ = 'leifj'
 
@@ -38,7 +61,7 @@ log = get_log(__name__)
 
 
 @pipe
-def dump(req, *opts):
+def dump(req: Plumbing.Request, *opts):
     """
     Print a representation of the entities set on stdout. Useful for testing.
 
@@ -53,8 +76,63 @@ def dump(req, *opts):
         print("<EntitiesDescriptor xmlns=\"{}\"/>".format(NS['md']))
 
 
+@pipe(name="map")
+def _map(req: Plumbing.Request, *opts):
+    """
+
+    loop over the entities in a selection
+
+    :param req:
+    :param opts:
+    :return: None
+
+    **Examples**
+
+    .. code-block:: yaml
+
+        - map:
+           - ...statements...
+
+    Executes a set of statements in parallell (using a thread pool).
+
+    """
+
+    def _p(e):
+        entity_id = e.get('entityID')
+        ip = Plumbing(pipeline=req.args, pid="{}.each[{}]".format(req.plumbing.pid, entity_id))
+        ireq = Plumbing.Request(ip, req.md, t=e, scheduler=req.scheduler)
+        ireq.set_id(entity_id)
+        ireq.set_parent(req)
+        return ip.iprocess(ireq)
+
+    from multiprocessing.pool import ThreadPool
+
+    pool = ThreadPool()
+    result = pool.map(_p, iter_entities(req.t), chunksize=10)
+    log.info("processed {} entities".format(len(result)))
+
+
+@pipe(name="then")
+def _then(req: Plumbing.Request, *opts):
+    """
+    Call a named 'when' clause and return - akin to macro invocations for pyFF
+    """
+    for cb in [PipelineCallback(p, req, store=req.md.store) for p in opts]:
+        req.t = cb(req.t)
+    return req.t
+
+
+@pipe(name="log_entity")
+def _log_entity(req: Plumbing.Request, *opts):
+    """
+    log the request id as it is processed (typically the entity_id)
+    """
+    log.info(str(req.id))
+    return req.t
+
+
 @pipe(name="print")
-def _print_t(req, *opts):
+def _print_t(req: Plumbing.Request, *opts):
     """
 
     Print whatever is in the active tree without transformation
@@ -63,15 +141,25 @@ def _print_t(req, *opts):
     :param opts: Options (unused)
     :return: None
 
+    **Examples**
+
+    .. code-block:: yaml
+
+        - print
+           output: "somewhere.foo"
+
     """
-    fn = req.args.get('output', None)
+    fn = None
+    if isinstance(req.args, dict):
+        fn = req.args.get('output', None)
     if fn is not None:
         safe_write(fn, req.t)
     else:
         print(req.t)
 
+
 @pipe
-def end(req, *opts):
+def end(req: Plumbing.Request, *opts):
     """
     Exit with optional error code and message.
 
@@ -91,7 +179,7 @@ def end(req, *opts):
 
     """
     code = 0
-    if req.args is not None:
+    if isinstance(req.args, dict):
         code = req.args.get('code', 0)
         msg = req.args.get('message', None)
         if msg is not None:
@@ -100,7 +188,7 @@ def end(req, *opts):
 
 
 @pipe
-def fork(req, *opts):
+def fork(req: Plumbing.Request, *opts):
     """
     Make a copy of the working tree and process the arguments as a pipleline. This essentially resets the working
     tree and allows a new plumbing to run. Useful for producing multiple outputs from a single source.
@@ -165,8 +253,13 @@ def fork(req, *opts):
     if req.t is not None:
         nt = deepcopy(req.t)
 
-    ip = Plumbing(pipeline=req.args, pid="%s.fork" % req.plumbing.pid)
+    if not isinstance(req.args, list):
+        raise ValueError('Non-list arguments to "fork" not allowed')
+
+    ip = Plumbing(pipeline=req.args, pid=f'{req.plumbing.pid}.fork')
     ireq = Plumbing.Request(ip, req.md, t=nt, scheduler=req.scheduler)
+    ireq.set_id(req.id)
+    ireq.set_parent(req)
     ip.iprocess(ireq)
 
     if req.t is not None and ireq.t is not None and len(root(ireq.t)) > 0:
@@ -179,6 +272,7 @@ def fork(req, *opts):
     return req.t
 
 
+@deprecated(reason="any pipeline has been replace by other behaviour")
 @pipe(name='any')
 def _any(lst, d):
     for x in lst:
@@ -191,7 +285,7 @@ def _any(lst, d):
 
 
 @pipe(name='break')
-def _break(req, *opts):
+def _break(req: Plumbing.Request, *opts):
     """
     Break out of a pipeline.
 
@@ -217,7 +311,7 @@ def _break(req, *opts):
 
 
 @pipe(name='pipe')
-def _pipe(req, *opts):
+def _pipe(req: Plumbing.Request, *opts):
     """
     Run the argument list as a pipleine.
 
@@ -256,13 +350,16 @@ def _pipe(req, *opts):
         - two
 
     """
-    ot = Plumbing(pipeline=req.args, pid="%s.pipe" % req.plumbing.id).iprocess(req)
+    if not isinstance(req.args, list):
+        raise ValueError('Non-list arguments to "pipe" not allowed')
+
+    ot = Plumbing(pipeline=req.args, pid=f'{req.plumbing.id}.pipe').iprocess(req)
     req.done = False
     return ot
 
 
 @pipe
-def when(req, condition, *values):
+def when(req: Plumbing.Request, condition: str, *values):
     """
     Conditionally execute part of the pipeline.
 
@@ -287,13 +384,18 @@ def when(req, condition, *values):
     followed. If 'bar' is present in the state with the value 'bill' then the other branch is followed.
     """
     c = req.state.get(condition, None)
+    if c is None:
+        log.debug(f'Condition {repr(condition)} not present in state {req.state}')
     if c is not None and (not values or _any(values, c)):
+        if not isinstance(req.args, list):
+            raise ValueError('Non-list arguments to "when" not allowed')
+
         return Plumbing(pipeline=req.args, pid="%s.when" % req.plumbing.id).iprocess(req)
     return req.t
 
 
 @pipe
-def info(req, *opts):
+def info(req: Plumbing.Request, *opts):
     """
     Dumps the working document on stdout. Useful for testing.
 
@@ -311,7 +413,7 @@ def info(req, *opts):
 
 
 @pipe
-def sort(req, *opts):
+def sort(req: Plumbing.Request, *opts):
     """
     Sorts the working entities by the value returned by the given xpath.
     By default, entities are sorted by 'entityID' when the 'order_by [xpath]' option is omitted and
@@ -334,15 +436,16 @@ def sort(req, *opts):
     if req.t is None:
         raise PipeException("Unable to sort empty document.")
 
-    opts = dict(list(zip(opts[0:1], [" ".join(opts[1:])])))
-    opts.setdefault('order_by', None)
-    sort_entities(req.t, opts['order_by'])
+    _opts: Dict[str, Optional[str]] = dict(list(zip(opts[0:1], [" ".join(opts[1:])])))
+    if 'order_by' not in _opts:
+        _opts['order_by'] = None
+    sort_entities(req.t, _opts['order_by'])
 
     return req.t
 
 
 @pipe
-def publish(req, *opts):
+def publish(req: Plumbing.Request, *opts):
     """
     Publish the working document in XML form.
 
@@ -357,25 +460,62 @@ def publish(req, *opts):
     .. code-block:: yaml
 
         - publish: /tmp/idp.xml
+
+    The full set of options with their corresponding defaults:
+
+    .. code-block:: yaml
+
+        - publish:
+             output: output
+             raw: false
+             urlencode_filenames: false
+             hash_link: false
+             update_store: true
+             ext: .xml
+
+    If output is an existing directory, publish will write the working tree to a filename in the directory
+    based on the @entityID or @Name attribute. Unless 'raw' is set to true the working tree will be serialized
+    to a string before writing. If true, 'hash_link' will generate a symlink based on the hash id (sha1) for
+    compatibility with MDQ. Unless false, 'update_store' will cause the the current store to be updated with
+    the published artifact. Setting 'ext' allows control over the file extension.
     """
 
     if req.t is None:
         raise PipeException("Empty document submitted for publication")
 
     if req.args is None:
-        raise PipeException("publish must specify output")
+        raise PipeException("Publish must at least specify output")
 
-    try:
-        validate_document(req.t)
-    except DocumentInvalid as ex:
-        log.error(ex.error_log)
-        raise PipeException("XML schema validation failed")
+    if not isinstance(req.args, dict):
+        req.args = dict(output=req.args[0])
 
-    output_file = None
-    if type(req.args) is dict:
-        output_file = req.args.get("output", None)
-    else:
-        output_file = req.args[0]
+    for t in ('raw', 'update_store', 'hash_link', 'urlencode_filenames'):
+        if t in req.args and type(req.args[t]) is not bool:
+            req.args[t] = strtobool(str(req.args[t]))
+
+    req.args.setdefault('ext', '.xml')
+    req.args.setdefault('output_file', 'output')
+    req.args.setdefault('raw', False)
+    req.args.setdefault('update_store', True)
+    req.args.setdefault('hash_link', False)
+    req.args.setdefault('urlencode_filenames', False)
+
+    output_file = req.args.get("output", None)
+
+    if not req.args.get('raw'):
+        try:
+            validate_document(req.t)
+        except DocumentInvalid as ex:
+            log.error(ex.error_log)
+            raise PipeException("XML schema validation failed")
+
+    def _nop(x):
+        return x
+
+    enc = _nop
+    if req.args.get('urlencode_filenames'):
+        enc = quote_plus
+
     if output_file is not None:
         output_file = output_file.strip()
         resource_name = output_file
@@ -384,19 +524,31 @@ def publish(req, *opts):
             output_file = m.group(1)
             resource_name = m.group(2)
         out = output_file
+        data = req.t
+        if not req.args.get('raw'):
+            data = dumptree(req.t)
+
         if os.path.isdir(output_file):
-            out = "{}.xml".format(os.path.join(output_file, req.id))
+            file_name = "{}{}".format(enc(req.id), req.args.get('ext'))
+            out = os.path.join(output_file, file_name)
+            safe_write(out, data, mkdirs=True)
+            if req.args.get('hash_link'):
+                link_name = "{}{}".format(enc(hash_id(req.id)), req.args.get('ext'))
+                link_path = os.path.join(output_file, link_name)
+                if os.path.exists(link_path):
+                    os.unlink(link_path)
+                os.symlink(file_name, link_path)
+        else:
+            safe_write(out, data, mkdirs=True)
 
-        data = dumptree(req.t)
-
-        safe_write(out, data)
-        req.store.update(req.t, tid=resource_name)  # TODO maybe this is not the right thing to do anymore
+        if req.args.get('update_store'):
+            req.store.update(req.t, tid=resource_name)  # TODO maybe this is not the right thing to do anymore
     return req.t
 
 
 @pipe
 @deprecated(reason="stats subsystem was removed")
-def loadstats(req, *opts):
+def loadstats(req: Plumbing.Request, *opts):
     """
     Log (INFO) information about the result of the last call to load
 
@@ -410,7 +562,7 @@ def loadstats(req, *opts):
 
 @pipe
 @deprecated(reason="replaced with load")
-def remote(req, *opts):
+def remote(req: Plumbing.Request, *opts):
     """
     Deprecated. Calls :py:mod:`pyff.pipes.builtins.load`.
     """
@@ -419,7 +571,7 @@ def remote(req, *opts):
 
 @pipe
 @deprecated(reason="replaced with load")
-def local(req, *opts):
+def local(req: Plumbing.Request, *opts):
     """
     Deprecated. Calls :py:mod:`pyff.pipes.builtins.load`.
     """
@@ -428,17 +580,17 @@ def local(req, *opts):
 
 @pipe
 @deprecated(reason="replaced with load")
-def _fetch(req, *opts):
+def _fetch(req: Plumbing.Request, *opts):
     return load(req, *opts)
 
 
 @pipe
-def load(req, *opts):
+def load(req: Plumbing.Request, *opts):
     """
     General-purpose resource fetcher.
 
         :param req: The request
-        :param opts: Options: See "Options" below
+        :param _opts: Options: See "Options" below
         :return: None
 
     Supports both remote and local resources. Fetching remote resources is done in parallel using threads.
@@ -460,7 +612,7 @@ def load(req, *opts):
     - max_workers <5> : Number of parallel threads to use for loading MD files
     - timeout <120> : Socket timeout when downloading files
     - validate <True*|False> : When true downloaded metadata files are validated (schema validation)
-    - fail_on_error <True|False*> : Control whether an error during download, parsing or (optional)validatation of a MD file
+    - fail_on_error <True|False*> : Control whether an error during download, parsing or (optional)validation of a MD file
                                     does not abort processing of the pipeline. When true a failure aborts and causes pyff
                                     to exit with a non zero exit code. Otherwise errors are logged but ignored.
     - filter_invalid <True*|False> : Controls validation behaviour. When true Entities that fail validation are filtered
@@ -468,54 +620,63 @@ def load(req, *opts):
                                      fail_on_error controls whether failure to validating the entire MD file will abort
                                      processing of the pipeline.
     """
-    opts = dict(list(zip(opts[::2], opts[1::2])))
-    opts.setdefault('timeout', 120)
-    opts.setdefault('max_workers', 5)
-    opts.setdefault('validate', "True")
-    opts.setdefault('fail_on_error', "False")
-    opts.setdefault('filter_invalid', "True")
-    opts['validate'] = bool(strtobool(opts['validate']))
-    opts['fail_on_error'] = bool(strtobool(opts['fail_on_error']))
-    opts['filter_invalid'] = bool(strtobool(opts['filter_invalid']))
+    _opts = dict(list(zip(opts[::2], opts[1::2])))
+    _opts.setdefault('timeout', 120)
+    _opts.setdefault('max_workers', 5)
+    _opts.setdefault('validate', "True")
+    _opts.setdefault('fail_on_error', "False")
+    _opts.setdefault('filter_invalid', "True")
+    _opts['validate'] = bool(strtobool(_opts['validate']))
+    _opts['fail_on_error'] = bool(strtobool(_opts['fail_on_error']))
+    _opts['filter_invalid'] = bool(strtobool(_opts['filter_invalid']))
 
-    remotes = []
+    if not isinstance(req.args, list):
+        raise ValueError('Non-list args to "load" not allowed')
+
     for x in req.args:
         x = x.strip()
-        log.debug("load parsing '%s'" % x)
+        log.debug(f"load parsing '{x}'")
         r = x.split()
 
         assert len(r) in range(1, 8), PipeException(
-            "Usage: load resource [as url] [[verify] verification] [via pipeline] [cleanup pipeline]")
+            "Usage: load resource [as url] [[verify] verification] [via pipeline] [cleanup pipeline]"
+        )
 
         url = r.pop(0)
-        params = {"via": [], "cleanup": [], "verify": None, "as": url}
+
+        # Copy parent node opts as a starting point
+        child_opts = req.md.rm.opts.copy(update={"via": [], "cleanup": [], "verify": None, "alias": url})
 
         while len(r) > 0:
             elt = r.pop(0)
             if elt in ("as", "verify", "via", "cleanup"):
+                # These elements have an argument
                 if len(r) > 0:
-                    if elt in ("via", "cleanup"):
-                        params[elt].append(r.pop(0))
+                    value = r.pop(0)
+                    if elt == "as":
+                        child_opts.alias = value
+                    elif elt == "verify":
+                        child_opts.verify = value
+                    elif elt == "via":
+                        child_opts.via.append(PipelineCallback(value, req, store=req.md.store))
+                    elif elt == "cleanup":
+                        child_opts.cleanup.append(PipelineCallback(value, req, store=req.md.store))
                     else:
-                        params[elt] = r.pop(0)
+                        raise ValueError(f'Unhandled resource option {elt}')
                 else:
                     raise PipeException(
-                        "Usage: load resource [as url] [[verify] verification] [via pipeline]* [cleanup pipeline]*")
+                        "Usage: load resource [as url] [[verify] verification] [via pipeline]* [cleanup pipeline]*"
+                    )
             else:
-                params['verify'] = elt
+                child_opts.verify = elt
 
-        if params['via'] is not None:
-            params['via'] = [PipelineCallback(pipe, req, store=req.md.store) for pipe in params['via']]
+        # override anything in child_opts with what is in opts
+        child_opts = child_opts.copy(update=_opts)
 
-        if params['cleanup'] is not None:
-            params['cleanup'] = [PipelineCallback(pipe, req, store=req.md.store) for pipe in params['cleanup']]
-
-        params.update(opts)
-
-        req.md.rm.add_child(url, **params)
+        req.md.rm.add_child(url, child_opts)
 
     log.debug("Refreshing all resources")
-    req.md.rm.reload(fail_on_error=bool(opts['fail_on_error']))
+    req.md.rm.reload(fail_on_error=bool(_opts['fail_on_error']))
 
 
 def _select_args(req):
@@ -529,13 +690,13 @@ def _select_args(req):
     if args is None or not args:
         args = []
 
-    log.debug("selecting using args: %s" % args)
+    log.info("selecting using args: %s" % args)
 
     return args
 
 
 @pipe
-def select(req, *opts):
+def select(req: Plumbing.Request, *opts):
     """
     Select a set of EntityDescriptor elements as the working document.
 
@@ -575,7 +736,7 @@ def select(req, *opts):
     This would select all SPs
 
     Select statements are not cumulative - a select followed by another select in the plumbing resets the
-    working douments to the result of the second select.
+    working documents to the result of the second select.
 
     Most statements except local and remote depend on having a select somewhere in your plumbing and will
     stop the plumbing if the current working document is empty. For instance, running
@@ -616,12 +777,14 @@ def select(req, *opts):
 
         def _strings(elt):
             lst = []
-            for attr in ['{%s}DisplayName' % NS['mdui'],
-                         '{%s}ServiceName' % NS['md'],
-                         '{%s}OrganizationDisplayName' % NS['md'],
-                         '{%s}OrganizationName' % NS['md'],
-                         '{%s}Keywords' % NS['mdui'],
-                         '{%s}Scope' % NS['shibmd']]:
+            for attr in [
+                '{%s}DisplayName' % NS['mdui'],
+                '{%s}ServiceName' % NS['md'],
+                '{%s}OrganizationDisplayName' % NS['md'],
+                '{%s}OrganizationName' % NS['md'],
+                '{%s}Keywords' % NS['mdui'],
+                '{%s}Scope' % NS['shibmd'],
+            ]:
                 lst.extend([s.text for s in elt.iter(attr)])
             lst.append(elt.get('entityID'))
             return [item for item in lst if item is not None]
@@ -659,14 +822,14 @@ def select(req, *opts):
         raise PipeException("empty select - stop")
 
     if req.plumbing.id != name:
-        log.debug("storing synthentic collection {}".format(name))
+        log.debug("storing synthetic collection {}".format(name))
         req.store.update(ot, name)
 
     return ot
 
 
 @pipe(name="filter")
-def _filter(req, *opts):
+def _filter(req: Plumbing.Request, *opts):
     """
 
     Refines the working document by applying a filter. The filter expression is a subset of the
@@ -716,7 +879,7 @@ def _filter(req, *opts):
 
 
 @pipe
-def pick(req, *opts):
+def pick(req: Plumbing.Request, *opts):
     """
 
     Select a set of EntityDescriptor elements as a working document but don't validate it.
@@ -736,7 +899,7 @@ def pick(req, *opts):
 
 
 @pipe
-def first(req, *opts):
+def first(req: Plumbing.Request, *opts):
     """
 
     If the working document is a single EntityDescriptor, strip the outer EntitiesDescriptor element and return it.
@@ -746,7 +909,7 @@ def first(req, *opts):
     :return: returns the first entity descriptor if the working document only contains one
 
     Sometimes (eg when running an MDX pipeline) it is usually expected that if a single EntityDescriptor is being returned
-    then the outer EntitiesDescriptor is stripped. This method does exactly that:
+    then the outer EntitiesDescriptor is stripped. This method does exactly that.
 
     """
     if req.t is None:
@@ -766,7 +929,7 @@ def first(req, *opts):
 
 
 @pipe(name='discojson')
-def _discojson(req, *opts):
+def _discojson(req: Plumbing.Request, *opts):
     """
 
     Return a discojuice-compatible json representation of the tree
@@ -778,7 +941,7 @@ def _discojson(req, *opts):
     cache & converted to data: URIs
 
     :param req: The request
-    :param opts: Options (unusued)
+    :param opts: Options (unused)
     :return: returns a JSON array
 
     """
@@ -793,7 +956,7 @@ def _discojson(req, *opts):
 
 
 @pipe
-def sign(req, *opts):
+def sign(req: Plumbing.Request, *_opts):
     """
 
     Sign the working document.
@@ -842,7 +1005,7 @@ def sign(req, *opts):
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
-    if not type(req.args) is dict:
+    if not isinstance(req.args, dict):
         raise PipeException("Missing key and cert arguments to sign pipe")
 
     key_file = req.args.get('key', None)
@@ -858,14 +1021,14 @@ def sign(req, *opts):
     relt = root(req.t)
     idattr = relt.get('ID')
     if idattr:
-        opts['reference_uri'] = "#%s" % idattr
+        opts['reference_uri'] = f'#{idattr}'
     xmlsec.sign(req.t, key_file, cert_file, **opts)
 
     return req.t
 
 
 @pipe
-def stats(req, *opts):
+def stats(req: Plumbing.Request, *opts):
     """
 
     Display statistics about the current working document.
@@ -891,16 +1054,18 @@ def stats(req, *opts):
 
     if req.t is not None:
         print("selected:       {:d}".format(len(req.t.xpath("//md:EntityDescriptor", namespaces=NS))))
-        print("          idps: {:d}".format(
-            len(req.t.xpath("//md:EntityDescriptor[md:IDPSSODescriptor]", namespaces=NS))))
         print(
-            "           sps: {:d}".format(len(req.t.xpath("//md:EntityDescriptor[md:SPSSODescriptor]", namespaces=NS))))
+            "          idps: {:d}".format(len(req.t.xpath("//md:EntityDescriptor[md:IDPSSODescriptor]", namespaces=NS)))
+        )
+        print(
+            "           sps: {:d}".format(len(req.t.xpath("//md:EntityDescriptor[md:SPSSODescriptor]", namespaces=NS)))
+        )
     print("---")
     return req.t
 
 
 @pipe
-def summary(req, *opts):
+def summary(req: Plumbing.Request, *opts):
     """
 
     Display a summary of the repository
@@ -916,7 +1081,7 @@ def summary(req, *opts):
 
 
 @pipe(name='store')
-def _store(req, *opts):
+def _store(req: Plumbing.Request, *opts):
     """
 
     Save the working document as separate files
@@ -936,8 +1101,7 @@ def _store(req, *opts):
     if not req.args:
         raise PipeException("store requires an argument")
 
-    target_dir = None
-    if type(req.args) is dict:
+    if isinstance(req.args, dict):
         target_dir = req.args.get('directory', None)
     else:
         target_dir = req.args[0]
@@ -951,9 +1115,8 @@ def _store(req, *opts):
     return req.t
 
 
-
 @pipe
-def xslt(req, *opts):
+def xslt(req: Plumbing.Request, *opts):
     """
 
     Transform the working document using an XSLT file.
@@ -979,6 +1142,9 @@ def xslt(req, *opts):
     if req.t is None:
         raise PipeException("Your plumbing is missing a select statement.")
 
+    if not isinstance(req.args, dict):
+        raise ValueError('Non-dict args to "xslt" not allowed')
+
     stylesheet = req.args.get('stylesheet', None)
     if stylesheet is None:
         raise PipeException("xslt requires stylesheet")
@@ -986,14 +1152,14 @@ def xslt(req, *opts):
     params = dict((k, "\'%s\'" % v) for (k, v) in list(req.args.items()))
     del params['stylesheet']
     try:
-        return xslt_transform(req.t, stylesheet, params)
+        return root(xslt_transform(req.t, stylesheet, params))
     except Exception as ex:
         log.debug(traceback.format_exc())
         raise ex
 
 
 @pipe
-def validate(req, *opts):
+def validate(req: Plumbing.Request, *opts):
     """
 
     Validate the working document
@@ -1014,7 +1180,7 @@ def validate(req, *opts):
 
 
 @pipe
-def prune(req, *opts):
+def prune(req: Plumbing.Request, *opts):
     """
 
     Prune the active tree, removing all elements matching
@@ -1044,6 +1210,9 @@ def prune(req, *opts):
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
+    if not isinstance(req.args, list):
+        raise ValueError('Non-list args to "prune" not allowed')
+
     for path in req.args:
         for part in req.t.iterfind(path):
             parent = part.getparent()
@@ -1056,8 +1225,9 @@ def prune(req, *opts):
 
 
 @pipe
-def check_xml_namespaces(req, *opts):
+def check_xml_namespaces(req: Plumbing.Request, *opts):
     """
+    Ensure that all namespaces are http or httpd scheme URLs.
 
     :param req: The request
     :param opts: Options (not used)
@@ -1074,16 +1244,39 @@ def check_xml_namespaces(req, *opts):
                     u = urlparse(uri)
                     if u.scheme not in ('http', 'https'):
                         raise MetadataException(
-                            "Namespace URIs must be be http(s) URIs ('{}' declared on {})".format(uri, elt.tag))
+                            "Namespace URIs must be be http(s) URIs ('{}' declared on {})".format(uri, elt.tag)
+                        )
 
     with_tree(root(req.t), _verify)
     return req.t
 
 
 @pipe
-def certreport(req, *opts):
+def drop_xsi_type(req: Plumbing.Request, *opts):
     """
+    Remove all xsi namespaces from the tree.
 
+    :param req: The request
+    :param opts: Options (not used)
+    :return: drop all xsi:type declarations
+
+    """
+    if req.t is None:
+        raise PipeException("Your pipeline is missing a select statement.")
+
+    def _drop_xsi_type(elt):
+        try:
+            del elt.attrib["{%s}type" % NS["xsi"]]
+        except Exception as ex:
+            pass
+
+    with_tree(root(req.t), _drop_xsi_type)
+    return req.t
+
+
+@pipe
+def certreport(req: Plumbing.Request, *opts):
+    """
     Generate a report of the certificates (optionally limited by expiration time or key size) found in the selection.
 
     :param req: The request
@@ -1116,7 +1309,7 @@ def certreport(req, *opts):
     if not req.args:
         req.args = {}
 
-    if type(req.args) is not dict:
+    if not isinstance(req.args, dict):
         raise PipeException("usage: certreport {warning: 864000, error: 0}")
 
     error_seconds = int(req.args.get('error_seconds', "0"))
@@ -1124,81 +1317,86 @@ def certreport(req, *opts):
     error_bits = int(req.args.get('error_bits', "1024"))
     warning_bits = int(req.args.get('warning_bits', "2048"))
 
-    seen = {}
-    for eid in req.t.xpath("//md:EntityDescriptor/@entityID",
-                           namespaces=NS,
-                           smart_strings=False):
-        for cd in req.t.xpath("md:EntityDescriptor[@entityID='%s']//ds:X509Certificate" % eid,
-                              namespaces=NS,
-                              smart_strings=False):
+    seen: Dict[str, bool] = {}
+    for eid in req.t.xpath("//md:EntityDescriptor/@entityID", namespaces=NS, smart_strings=False):
+        for cd in req.t.xpath(
+            "md:EntityDescriptor[@entityID='%s']//ds:X509Certificate" % eid, namespaces=NS, smart_strings=False
+        ):
             try:
                 cert_pem = cd.text
                 cert_der = base64.b64decode(cert_pem)
                 m = hashlib.sha1()
                 m.update(cert_der)
                 fp = m.hexdigest()
-                if not seen.get(fp, False):
-                    entity_elt = cd.getparent().getparent().getparent().getparent().getparent()
+                if fp not in seen:
                     seen[fp] = True
+                    entity_elt = cd.getparent().getparent().getparent().getparent().getparent()
                     cdict = xmlsec.utils.b642cert(cert_pem)
                     keysize = cdict['modulus'].bit_length()
                     cert = cdict['cert']
                     if keysize < error_bits:
-                        annotate_entity(entity_elt,
-                                        "certificate-error",
-                                        "keysize too small",
-                                        "%s has keysize of %s bits (less than %s)" % (cert.getSubject(),
-                                                                                      keysize,
-                                                                                      error_bits))
+                        annotate_entity(
+                            entity_elt,
+                            "certificate-error",
+                            "keysize too small",
+                            "%s has keysize of %s bits (less than %s)" % (cert.getSubject(), keysize, error_bits),
+                        )
                         log.error("%s has keysize of %s" % (eid, keysize))
                     elif keysize < warning_bits:
-                        annotate_entity(entity_elt,
-                                        "certificate-warning",
-                                        "keysize small",
-                                        "%s has keysize of %s bits (less than %s)" % (cert.getSubject(),
-                                                                                      keysize,
-                                                                                      warning_bits))
-                        log.warn("%s has keysize of %s" % (eid, keysize))
+                        annotate_entity(
+                            entity_elt,
+                            "certificate-warning",
+                            "keysize small",
+                            "%s has keysize of %s bits (less than %s)" % (cert.getSubject(), keysize, warning_bits),
+                        )
+                        log.warning("%s has keysize of %s" % (eid, keysize))
 
                     notafter = cert.getNotAfter()
                     if notafter is None:
-                        annotate_entity(entity_elt,
-                                        "certificate-error",
-                                        "certificate has no expiration time",
-                                        "%s has no expiration time" % cert.getSubject())
+                        annotate_entity(
+                            entity_elt,
+                            "certificate-error",
+                            "certificate has no expiration time",
+                            "%s has no expiration time" % cert.getSubject(),
+                        )
                     else:
                         try:
                             et = datetime.strptime("%s" % notafter, "%y%m%d%H%M%SZ")
                             now = datetime.now()
                             dt = et - now
                             if total_seconds(dt) < error_seconds:
-                                annotate_entity(entity_elt,
-                                                "certificate-error",
-                                                "certificate has expired",
-                                                "%s expired %s ago" % (cert.getSubject(), -dt))
+                                annotate_entity(
+                                    entity_elt,
+                                    "certificate-error",
+                                    "certificate has expired",
+                                    "%s expired %s ago" % (cert.getSubject(), -dt),
+                                )
                                 log.error("%s expired %s ago" % (eid, -dt))
                             elif total_seconds(dt) < warning_seconds:
-                                annotate_entity(entity_elt,
-                                                "certificate-warning",
-                                                "certificate about to expire",
-                                                "%s expires in %s" % (cert.getSubject(), dt))
-                                log.warn("%s expires in %s" % (eid, dt))
+                                annotate_entity(
+                                    entity_elt,
+                                    "certificate-warning",
+                                    "certificate about to expire",
+                                    "%s expires in %s" % (cert.getSubject(), dt),
+                                )
+                                log.warning("%s expires in %s" % (eid, dt))
                         except ValueError as ex:
-                            annotate_entity(entity_elt,
-                                            "certificate-error",
-                                            "certificate has unknown expiration time",
-                                            "%s unknown expiration time %s" % (cert.getSubject(), notafter))
+                            annotate_entity(
+                                entity_elt,
+                                "certificate-error",
+                                "certificate has unknown expiration time",
+                                "%s unknown expiration time %s" % (cert.getSubject(), notafter),
+                            )
 
                     req.store.update(entity_elt)
             except Exception as ex:
                 log.debug(traceback.format_exc())
-                log.error(ex)
+                log.error(f'Got exception while creating certreport: {ex}')
 
 
 @pipe
-def emit(req, ctype="application/xml", *opts):
+def emit(req: Plumbing.Request, ctype="application/xml", *opts):
     """
-
     Returns a UTF-8 encoded representation of the working tree.
 
     :param req: The request
@@ -1248,9 +1446,8 @@ def emit(req, ctype="application/xml", *opts):
 
 
 @pipe
-def signcerts(req, *opts):
+def signcerts(req: Plumbing.Request, *opts):
     """
-
     Logs the fingerprints of the signing certs found in the current working tree.
 
     :param req: The request
@@ -1275,20 +1472,19 @@ def signcerts(req, *opts):
 
 
 @pipe
-def finalize(req, *opts):
+def finalize(req: Plumbing.Request, *opts):
     """
-
     Prepares the working document for publication/rendering.
 
     :param req: The request
     :param opts: Options (not used)
     :return: returns the working document with @Name, @cacheDuration and @validUntil set
 
-    Set Name, ID, cacheDuration and validUntil on the toplevel EntitiesDescriptor element of the working document. Unless
-    explicit provided the @Name is set from the request URI if the pipeline is executed in the pyFF server. The @ID is set
-    to a string representing the current date/time and will be prefixed with the string provided, which defaults to '_'. The
-    @cacheDuration element must be a valid xsd duration (eg PT5H for 5 hrs) and @validUntil can be either an absolute
-    ISO 8601 time string or (more comonly) a relative time on the form
+    Set Name, ID, cacheDuration and validUntil on the toplevel EntitiesDescriptor element of the working document.
+    Unless explicitly provided the @Name is set from the request URI if the pipeline is executed in the pyFF server. The
+    @ID is set to a string representing the current date/time and will be prefixed with the string provided, which
+    defaults to '_'. The @cacheDuration element must be a valid xsd duration (eg PT5H for 5 hrs) and @validUntil can
+    be either an absolute ISO 8601 time string or (more commonly) a relative time in the form
 
     .. code-block:: none
 
@@ -1312,6 +1508,9 @@ def finalize(req, *opts):
     if req.t is None:
         raise PipeException("Your plumbing is missing a select statement.")
 
+    if not isinstance(req.args, dict):
+        raise ValueError('Non-dict args to "finalize" not allowed')
+
     e = root(req.t)
     if e.tag == "{%s}EntitiesDescriptor" % NS['md']:
         name = req.args.get('name', None)
@@ -1324,10 +1523,13 @@ def finalize(req, *opts):
                 try:
                     name_url = urlparse(name)
                     base_url = urlparse(req.args.get('baseURL'))
-                    name = "{}://{}{}".format(base_url.scheme, base_url.netloc, name_url.path)
+                    # TODO: Investigate this error, which is probably correct:
+                    #       error: On Python 3 '{}'.format(b'abc') produces "b'abc'", not 'abc';
+                    #       use '{!r}'.format(b'abc') if this is desired behavior
+                    name = "{}://{}{}".format(base_url.scheme, base_url.netloc, name_url.path)  # type: ignore
                     log.debug("-------- using Name: %s" % name)
                 except ValueError as ex:
-                    log.debug(ex)
+                    log.debug(f'Got an exception while finalizing: {ex}')
                     name = None
         if name is None or 0 == len(name):
             name = e.get('Name', None)
@@ -1335,7 +1537,7 @@ def finalize(req, *opts):
         if name:
             e.set('Name', name)
 
-    now = datetime.utcnow()
+    now = utc_now()
 
     mdid = req.args.get('ID', 'prefix _')
     if re.match('(\s)*prefix(\s)*', mdid):
@@ -1352,19 +1554,22 @@ def finalize(req, *opts):
         offset = duration2timedelta(valid_until)
         if offset is not None:
             dt = now + offset
-            e.set('validUntil', dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+            e.set('validUntil', datetime2iso(dt))
         elif valid_until is not None:
+            # TODO: if validUntil was not present, valid_until will be the string 'None' here - never the literal None
             try:
-                dt = iso8601.parse_date(valid_until)
-                dt = dt.replace(tzinfo=None)  # make dt "naive" (tz-unaware)
+                dt = iso2datetime(valid_until)
                 offset = dt - now
-                e.set('validUntil', dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+                e.set('validUntil', datetime2iso(dt))
             except ValueError as ex:
                 log.error("Unable to parse validUntil: %s (%s)" % (valid_until, ex))
 
-                # set a reasonable default: 50% of the validity
+        # set a reasonable default: 50% of the validity
         # we replace this below if we have cacheDuration set
-        req.state['cache'] = int(total_seconds(offset) / 50)
+        # TODO: offset can be None here, if validUntil is not a valid duration or ISO date
+        #       What is the right action to take then?
+        if offset:
+            req.state['cache'] = int(total_seconds(offset) / 50)
 
     cache_duration = req.args.get('cacheDuration', e.get('cacheDuration', None))
     if cache_duration is not None and len(cache_duration) > 0:
@@ -1379,9 +1584,8 @@ def finalize(req, *opts):
 
 
 @pipe(name='reginfo')
-def _reginfo(req, *opts):
+def _reginfo(req: Plumbing.Request, *opts):
     """
-
     Sets registration info extension on EntityDescription element
 
     :param req: The request
@@ -1404,6 +1608,9 @@ def _reginfo(req, *opts):
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
+    if not isinstance(req.args, dict):
+        raise ValueError('Non-dict args to "reginfo" not allowed')
+
     for e in iter_entities(req.t):
         set_reginfo(e, **req.args)
 
@@ -1411,9 +1618,8 @@ def _reginfo(req, *opts):
 
 
 @pipe(name='pubinfo')
-def _pubinfo(req, *opts):
+def _pubinfo(req: Plumbing.Request, *opts):
     """
-
     Sets publication info extension on EntityDescription element
 
     :param req: The request
@@ -1434,15 +1640,17 @@ def _pubinfo(req, *opts):
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
+    if not isinstance(req.args, dict):
+        raise ValueError('Non-dict args to "pubinfo" not allowed')
+
     set_pubinfo(root(req.t), **req.args)
 
     return req.t
 
 
 @pipe(name='setattr')
-def _setattr(req, *opts):
+def _setattr(req: Plumbing.Request, *opts):
     """
-
     Sets entity attributes on the working document
 
     :param req: The request
@@ -1477,9 +1685,8 @@ def _setattr(req, *opts):
 
 
 @pipe(name='nodecountry')
-def _nodecountry(req, *opts):
+def _nodecountry(req: Plumbing.Request, *opts):
     """
-
     Sets eidas:NodeCountry
 
     :param req: The request
@@ -1501,6 +1708,9 @@ def _nodecountry(req, *opts):
     """
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
+
+    if not isinstance(req.args, dict):
+        raise ValueError('Non-dict args to "nodecountry" not allowed')
 
     for e in iter_entities(req.t):
         if req.args is not None and 'country' in req.args:
