@@ -4,7 +4,7 @@ cachetools
 gunicorn
 httplib2 >=0.7.7
 ipaddr
-lxml >=4.6.5
+lxml >=4.7.1
 mako
 pyXMLSecurity >=0.15
 pyconfig
