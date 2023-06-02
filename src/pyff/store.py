@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from threading import ThreadError
 
-import ipaddr
+import ipaddress
 import six
 from cachetools.func import ttl_cache
 from redis_collections import Dict, Set
@@ -303,8 +303,12 @@ class SAMLStoreBase(object):
         scheduler = kwargs.pop('scheduler', None)
         if watched is not None and scheduler is not None:
             for r in watched.walk():
+                if r.t is None and len(r.children) > 0:
+                    r.t = entitiesdescriptor(list(filter(lambda c: c is not None, [c.t for c in r.children])), name=r.name, validate=True, filter_invalid=True)
                 if r.t is not None:
                     self.update(r.t, tid=r.name, etag=r.etag)
+                else:
+                    log.debug(f'Nothing to update for resource {r.name} with {len(r.children)} children')
 
     def select(self, member, xp=None):
         """
@@ -421,7 +425,7 @@ class SAMLStoreBase(object):
             return [item for item in lst if item is not None]
 
         def _ip_networks(elt):
-            return [ipaddr.IPNetwork(x.text) for x in elt.iter('{%s}IPHint' % NS['mdui'])]
+            return [ipaddress.ip_network(x.text) for x in elt.iter('{%s}IPHint' % NS['mdui'])]
 
         def _match(qq, elt):
             for q in qq:
@@ -430,9 +434,7 @@ class SAMLStoreBase(object):
                     try:
                         nets = _ip_networks(elt)
                         for net in nets:
-                            if ':' in q and ipaddr.IPv6Address(q) in net:
-                                return net
-                            if '.' in q and ipaddr.IPv4Address(q) in net:
+                            if ipaddress.ip_address(q) in net:
                                 return net
                     except ValueError:
                         pass

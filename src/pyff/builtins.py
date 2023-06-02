@@ -12,12 +12,13 @@ import sys
 import traceback
 from copy import deepcopy
 from datetime import datetime
-from distutils.util import strtobool
+from str2bool import str2bool
 from typing import Dict, Optional
 
-import ipaddr
+import ipaddress
 import six
 import xmlsec
+from lxml import etree
 from lxml.etree import DocumentInvalid
 from six.moves.urllib_parse import quote_plus, urlparse
 
@@ -56,7 +57,7 @@ from pyff.utils import (
 
 __author__ = 'leifj'
 
-FILESPEC_REGEX = "([^ \t\n\r\f\v]+)\s+as\s+([^ \t\n\r\f\v]+)"
+FILESPEC_REGEX = r'([^ \t\n\r\f\v]+)\s+as\s+([^ \t\n\r\f\v]+)'
 log = get_log(__name__)
 
 
@@ -468,6 +469,7 @@ def publish(req: Plumbing.Request, *opts):
         - publish:
              output: output
              raw: false
+             pretty_print: false
              urlencode_filenames: false
              hash_link: false
              update_store: true
@@ -475,7 +477,8 @@ def publish(req: Plumbing.Request, *opts):
 
     If output is an existing directory, publish will write the working tree to a filename in the directory
     based on the @entityID or @Name attribute. Unless 'raw' is set to true the working tree will be serialized
-    to a string before writing. If true, 'hash_link' will generate a symlink based on the hash id (sha1) for
+    to a string before writing, with minimal formatting if 'pretty_print' is true (see 'indent' action for more
+    extensive control). If true, 'hash_link' will generate a symlink based on the hash id (sha1) for
     compatibility with MDQ. Unless false, 'update_store' will cause the the current store to be updated with
     the published artifact. Setting 'ext' allows control over the file extension.
     """
@@ -489,13 +492,14 @@ def publish(req: Plumbing.Request, *opts):
     if not isinstance(req.args, dict):
         req.args = dict(output=req.args[0])
 
-    for t in ('raw', 'update_store', 'hash_link', 'urlencode_filenames'):
+    for t in ('raw', 'pretty_print', 'update_store', 'hash_link', 'urlencode_filenames'):
         if t in req.args and type(req.args[t]) is not bool:
-            req.args[t] = strtobool(str(req.args[t]))
+            req.args[t] = str2bool(str(req.args[t]))
 
     req.args.setdefault('ext', '.xml')
     req.args.setdefault('output_file', 'output')
     req.args.setdefault('raw', False)
+    req.args.setdefault('pretty_print', False)
     req.args.setdefault('update_store', True)
     req.args.setdefault('hash_link', False)
     req.args.setdefault('urlencode_filenames', False)
@@ -526,7 +530,7 @@ def publish(req: Plumbing.Request, *opts):
         out = output_file
         data = req.t
         if not req.args.get('raw'):
-            data = dumptree(req.t)
+            data = dumptree(req.t, pretty_print=req.args.get('pretty_print'))
 
         if os.path.isdir(output_file):
             file_name = "{}{}".format(enc(req.id), req.args.get('ext'))
@@ -626,9 +630,9 @@ def load(req: Plumbing.Request, *opts):
     _opts.setdefault('validate', "True")
     _opts.setdefault('fail_on_error', "False")
     _opts.setdefault('filter_invalid', "True")
-    _opts['validate'] = bool(strtobool(_opts['validate']))
-    _opts['fail_on_error'] = bool(strtobool(_opts['fail_on_error']))
-    _opts['filter_invalid'] = bool(strtobool(_opts['filter_invalid']))
+    _opts['validate'] = bool(str2bool(_opts['validate']))
+    _opts['fail_on_error'] = bool(str2bool(_opts['fail_on_error']))
+    _opts['filter_invalid'] = bool(str2bool(_opts['filter_invalid']))
 
     if not isinstance(req.args, list):
         raise ValueError('Non-list args to "load" not allowed')
@@ -790,7 +794,7 @@ def select(req: Plumbing.Request, *opts):
             return [item for item in lst if item is not None]
 
         def _ip_networks(elt):
-            return [ipaddr.IPNetwork(x.text) for x in elt.iter('{%s}IPHint' % NS['mdui'])]
+            return [ipaddress.ip_network(x.text) for x in elt.iter('{%s}IPHint' % NS['mdui'])]
 
         def _match(q, elt):
             q = q.strip()
@@ -798,19 +802,17 @@ def select(req: Plumbing.Request, *opts):
                 try:
                     nets = _ip_networks(elt)
                     for net in nets:
-                        if ':' in q and ipaddr.IPv6Address(q) in net:
-                            return net
-                        if '.' in q and ipaddr.IPv4Address(q) in net:
+                        if ipaddress.ip_adress(q) in net:
                             return net
                 except ValueError:
                     pass
 
             if q is not None and len(q) > 0:
                 tokens = _strings(elt)
+                p = re.compile(r'\b{}'.format(q), re.IGNORECASE)
                 for tstr in tokens:
-                    for tpart in tstr.split():
-                        if tpart.lower().startswith(q):
-                            return tstr
+                    if p.search(tstr):
+                        return tstr
             return None
 
         log.debug("matching {} in {} entities".format(match, len(entities)))
@@ -1156,6 +1158,42 @@ def xslt(req: Plumbing.Request, *opts):
     except Exception as ex:
         log.debug(traceback.format_exc())
         raise ex
+
+@pipe
+def indent(req: Plumbing.Request, *opts):
+    """
+
+    Transform the working document using proper indentation. Requires lxml >= 4.5
+
+    :param req: The request
+    :param opts: Options (unused)
+    :return: the transformation result
+
+    Indent the working document.
+
+    **Examples**
+
+    .. code-block:: yaml
+
+        - indent:
+            space: '    '
+
+    """
+    if req.t is None:
+        raise PipeException("Your plumbing is missing a select statement.")
+
+    if not req.args:
+        req.args = {}
+
+    if not isinstance(req.args, dict):
+        raise PipeException("usage: indent {space: '    '}")
+
+    space = req.args.get('space', '  ')
+
+    if callable(getattr(etree, 'indent', None)):
+        return etree.indent(req.t, space=space)
+    else:
+        raise PipeException("lxml version >= 4.5 required.")
 
 
 @pipe
@@ -1540,8 +1578,8 @@ def finalize(req: Plumbing.Request, *opts):
     now = utc_now()
 
     mdid = req.args.get('ID', 'prefix _')
-    if re.match('(\s)*prefix(\s)*', mdid):
-        prefix = re.sub('^(\s)*prefix(\s)*', '', mdid)
+    if re.match(r'(\s)*prefix(\s)*', mdid):
+        prefix = re.sub(r'^(\s)*prefix(\s)*', '', mdid)
         _id = now.strftime(prefix + "%Y%m%dT%H%M%SZ")
     else:
         _id = mdid
