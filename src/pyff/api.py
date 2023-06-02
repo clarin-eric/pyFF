@@ -141,7 +141,7 @@ def request_handler(request: Request) -> Response:
     :param request: the HTTP request object
     :return: the data to send to the client
     """
-    key = request.path
+    key = request.path_qs
     r = None
     try:
         r = request.registry.cache[key]
@@ -213,7 +213,8 @@ def process_handler(request: Request) -> Response:
     if 'entities' not in alias:
         pfx = request.registry.aliases.get(alias, None)
         if pfx is None:
-            raise exc.exception_response(404)
+            log.debug("alias {} not found - passing to storage lookup".format(alias))
+            path=alias #treat as path
 
     # content_negotiation_policy is one of three values:
     # 1. extension - current default, inspect the path and if it ends in
