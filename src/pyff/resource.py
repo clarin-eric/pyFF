@@ -7,16 +7,16 @@ from __future__ import annotations
 
 import os
 import traceback
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime
 from enum import Enum
 from threading import Condition, Lock
-from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import quote as urlescape
 
 import requests
 from lxml.etree import ElementTree
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, BaseModel, Field
 from requests.adapters import Response
 
 from pyff.constants import config
@@ -89,8 +89,9 @@ class URLHandler(object):
 
     def i_schedule(self, things):
         for t in things:
-            self.pending[self.thing_to_url(t)] = t
-            self.fetcher.schedule(self.thing_to_url(t))
+            url = self.thing_to_url(t)
+            self.pending[url] = t
+            self.fetcher.schedule(url)
 
     def i_handle(self, t, url=None, response=None, exception=None, last_fetched=None):
         raise NotImplementedError()
@@ -144,7 +145,9 @@ class ResourceHandler(URLHandler):
             if exception is not None:
                 t.info.exception = exception
             else:
-                children = t.parse(lambda u: response)
+                children = t.parse(lambda u, v: response)
+                if t.t is None:
+                    log.debug(f'no thing while i_handle {url}')
                 self.i_schedule(children)
         except BaseException as ex:
             log.debug(traceback.format_exc())
@@ -166,9 +169,8 @@ class ResourceOpts(BaseModel):
     filter_invalid: bool = True
     # set to False to turn off all XML schema validation
     validate_schema: bool = Field(True, alias='validate')
-
-    class Config:
-        arbitrary_types_allowed = True
+    verify_tls: bool = False
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def to_dict(self) -> Dict[str, Any]:
         res = self.dict()
@@ -190,13 +192,11 @@ class ResourceInfo(BaseModel):
     state: Optional[ResourceLoadState] = None
     http_headers: Dict[str, Any] = Field({})
     reason: Optional[str] = None
-    status_code: Optional[str]  # HTTP status code as string. TODO: change to int
+    status_code: Optional[str] = None # HTTP status code as string. TODO: change to int
     parser_info: Optional[ParserInfo] = None
     expired: Optional[bool] = None
     exception: Optional[BaseException] = None
-
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def to_dict(self) -> Dict[str, Any]:
         def _format_key(k: str) -> str:
@@ -221,7 +221,6 @@ class ResourceInfo(BaseModel):
 
         return res
 
-
 class Resource(Watchable):
     def __init__(self, url: Optional[str], opts: ResourceOpts):
         super().__init__()
@@ -236,6 +235,8 @@ class Resource(Watchable):
         self.last_parser: Optional['PyffParser'] = None  # importing PyffParser in this module causes a loop
         self._infos: Deque[ResourceInfo] = deque(maxlen=config.info_buffer_size)
         self.children: Deque[Resource] = deque()
+        self.trust_info: Optional[dict] = None
+        self.md_sources: Optional[dict] = None
         self._setup()
 
     def _setup(self):
@@ -296,7 +297,6 @@ class Resource(Watchable):
                     rp.done.release()
                 rp.fetcher.stop()
                 rp.fetcher.join()
-
             self.notify()
 
     def __len__(self):
@@ -392,6 +392,7 @@ class Resource(Watchable):
         data: Optional[str] = None
         status: int = 500
         info = self.add_info()
+        verify_tls = self.opts.verify_tls
 
         log.debug("Loading resource {}".format(self.url))
 
@@ -400,7 +401,7 @@ class Resource(Watchable):
             return data, status, info
 
         try:
-            r = getter(self.url)
+            r = getter(self.url, verify_tls)
 
             info.http_headers = dict(r.headers)
             log.debug(
@@ -468,7 +469,10 @@ class Resource(Watchable):
             if self.post:
                 for cb in self.post:
                     if self.t is not None:
-                        self.t = cb(self.t, self.opts.dict())
+                        n_t = cb(self.t, self.opts.dict())
+                        if n_t is None:
+                            log.warn(f'callback did not return anything when parsing {self.url} {info}')
+                        self.t = n_t
 
             if self.is_expired():
                 info.expired = True
@@ -479,7 +483,28 @@ class Resource(Watchable):
             if info.parser_info:
                 for (eid, error) in list(info.parser_info.validation_errors.items()):
                     log.error(error)
+        else:
+            log.debug(f'Parser did not produce anything (probably ok) when parsing {self.url} {info}')
 
         info.state = ResourceLoadState.Ready
 
         return self.children
+
+    def global_trust_info(self):
+        trust_info = {}
+        for r in self.walk():
+            if r.url and r.trust_info is not None:
+                trust_info[r.url] = r.trust_info['profiles']
+        return trust_info
+
+    def global_md_sources(self):
+        from pyff.samlmd import SAMLParserInfo
+
+        md_sources = defaultdict(list)
+        for r in self.walk():
+            if r.url:
+                for info in r._infos:
+                    if isinstance(info.parser_info, SAMLParserInfo):
+                        for entity_id in info.parser_info.entities:
+                            md_sources[entity_id].append(r.url)
+        return md_sources

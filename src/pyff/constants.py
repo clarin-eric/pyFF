@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import sys
-from distutils.util import strtobool
+from str2bool import str2bool
 
 import pyconfig
 import six
@@ -36,6 +36,7 @@ NS = dict(
     xsi="http://www.w3.org/2001/XMLSchema-instance",
     ser="http://eidas.europa.eu/metadata/servicelist",
     eidas="http://eidas.europa.eu/saml-extensions",
+    ti="https://seamlessaccess.org/NS/trustinfo",
 )
 
 #: These are the attribute aliases pyFF knows about. These are used to build URI paths, populate the index
@@ -87,7 +88,7 @@ def as_dict_of_string(o):
 
 def as_bool(o):
     if type(o) not in ('bool',):
-        o = bool(strtobool(str(o)))
+        o = bool(str2bool(str(o)))
     return o
 
 
@@ -313,6 +314,7 @@ class Config(object):
     )
 
     base_dir = S("base_dir", info="change to this directory before executing the pipeline")
+    compat_dir = S("dir", hidden=True, info="cf base_dir")
 
     modules = S("modules", default=[], typeconv=as_list_of_string, hidden=True, info="modules providing plugins")
 
@@ -553,6 +555,9 @@ def parse_options(program, docs):
                         setattr(s, 'value', a)
                 else:
                     raise ValueError("Unknown option {}".format(o))
+
+        if config.compat_dir and not config.base_dir:
+            config.base_dir = config.compat_dir
 
     except Exception as ex:
         print(ex)

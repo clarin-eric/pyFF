@@ -12,12 +12,14 @@ import sys
 import traceback
 from copy import deepcopy
 from datetime import datetime
-from distutils.util import strtobool
+from io import BytesIO
+from str2bool import str2bool
 from typing import Dict, Optional
 
-import ipaddr
+import ipaddress
 import six
 import xmlsec
+from lxml import etree
 from lxml.etree import DocumentInvalid
 from six.moves.urllib_parse import quote_plus, urlparse
 
@@ -28,6 +30,7 @@ from pyff.logs import get_log
 from pyff.pipes import PipeException, PipelineCallback, Plumbing, pipe, registry
 from pyff.samlmd import (
     annotate_entity,
+    discojson_sp_t,
     discojson_t,
     entitiesdescriptor,
     find_in_document,
@@ -45,6 +48,7 @@ from pyff.utils import (
     duration2timedelta,
     hash_id,
     iso2datetime,
+    parse_xml,
     root,
     safe_write,
     total_seconds,
@@ -56,7 +60,7 @@ from pyff.utils import (
 
 __author__ = 'leifj'
 
-FILESPEC_REGEX = "([^ \t\n\r\f\v]+)\s+as\s+([^ \t\n\r\f\v]+)"
+FILESPEC_REGEX = r'([^ \t\n\r\f\v]+)\s+as\s+([^ \t\n\r\f\v]+)'
 log = get_log(__name__)
 
 
@@ -248,10 +252,30 @@ def fork(req: Plumbing.Request, *opts):
             - setattr:
                 attribute: value
 
+    **parsecopy**
+
+    Due to a hard to find bug, fork which uses deepcopy can lose some namespaces. The parsecopy argument is a workaround.
+    It uses a brute force serialisation and deserialisation to get around the bug. 
+
+    .. code-block:: yaml
+
+        - select  # select all entities
+        - fork parsecopy:
+            - certreport
+            - publish:
+                 output: "/tmp/annotated.xml"
+        - fork:
+            - xslt:
+                 stylesheet: tidy.xml
+            - publish:
+                 output: "/tmp/clean.xml"
     """
     nt = None
     if req.t is not None:
-        nt = deepcopy(req.t)
+        if 'parsecopy' in opts:
+            nt = root(parse_xml(BytesIO(dumptree(req.t))))
+        else:
+            nt = deepcopy(req.t)
 
     if not isinstance(req.args, list):
         raise ValueError('Non-list arguments to "fork" not allowed')
@@ -468,6 +492,7 @@ def publish(req: Plumbing.Request, *opts):
         - publish:
              output: output
              raw: false
+             pretty_print: false
              urlencode_filenames: false
              hash_link: false
              update_store: true
@@ -475,7 +500,8 @@ def publish(req: Plumbing.Request, *opts):
 
     If output is an existing directory, publish will write the working tree to a filename in the directory
     based on the @entityID or @Name attribute. Unless 'raw' is set to true the working tree will be serialized
-    to a string before writing. If true, 'hash_link' will generate a symlink based on the hash id (sha1) for
+    to a string before writing, with minimal formatting if 'pretty_print' is true (see 'indent' action for more
+    extensive control). If true, 'hash_link' will generate a symlink based on the hash id (sha1) for
     compatibility with MDQ. Unless false, 'update_store' will cause the the current store to be updated with
     the published artifact. Setting 'ext' allows control over the file extension.
     """
@@ -489,13 +515,14 @@ def publish(req: Plumbing.Request, *opts):
     if not isinstance(req.args, dict):
         req.args = dict(output=req.args[0])
 
-    for t in ('raw', 'update_store', 'hash_link', 'urlencode_filenames'):
+    for t in ('raw', 'pretty_print', 'update_store', 'hash_link', 'urlencode_filenames'):
         if t in req.args and type(req.args[t]) is not bool:
-            req.args[t] = strtobool(str(req.args[t]))
+            req.args[t] = str2bool(str(req.args[t]))
 
     req.args.setdefault('ext', '.xml')
     req.args.setdefault('output_file', 'output')
     req.args.setdefault('raw', False)
+    req.args.setdefault('pretty_print', False)
     req.args.setdefault('update_store', True)
     req.args.setdefault('hash_link', False)
     req.args.setdefault('urlencode_filenames', False)
@@ -526,7 +553,7 @@ def publish(req: Plumbing.Request, *opts):
         out = output_file
         data = req.t
         if not req.args.get('raw'):
-            data = dumptree(req.t)
+            data = dumptree(req.t, pretty_print=req.args.get('pretty_print'))
 
         if os.path.isdir(output_file):
             file_name = "{}{}".format(enc(req.id), req.args.get('ext'))
@@ -595,7 +622,7 @@ def load(req: Plumbing.Request, *opts):
 
     Supports both remote and local resources. Fetching remote resources is done in parallel using threads.
 
-    Note: When downloading remote files over HTTPS the TLS server certificate is not validated.
+    Note: When downloading remote files over HTTPS the TLS server certificate is not validated by default
     Note: Default behaviour is to ignore metadata files or entities in MD files that cannot be loaded
 
     Options are put directly after "load". E.g:
@@ -619,6 +646,7 @@ def load(req: Plumbing.Request, *opts):
                                      I.e. are not loaded. When false the entire metadata file is either loaded, or not.
                                      fail_on_error controls whether failure to validating the entire MD file will abort
                                      processing of the pipeline.
+    - verify_tls <True|False*>     : Controls the validation of the host's TLS certificate on fetching the resources
     """
     _opts = dict(list(zip(opts[::2], opts[1::2])))
     _opts.setdefault('timeout', 120)
@@ -626,9 +654,11 @@ def load(req: Plumbing.Request, *opts):
     _opts.setdefault('validate', "True")
     _opts.setdefault('fail_on_error', "False")
     _opts.setdefault('filter_invalid', "True")
-    _opts['validate'] = bool(strtobool(_opts['validate']))
-    _opts['fail_on_error'] = bool(strtobool(_opts['fail_on_error']))
-    _opts['filter_invalid'] = bool(strtobool(_opts['filter_invalid']))
+    _opts.setdefault('verify_tls', "False")
+    _opts['validate'] = bool(str2bool(_opts['validate']))
+    _opts['fail_on_error'] = bool(str2bool(_opts['fail_on_error']))
+    _opts['filter_invalid'] = bool(str2bool(_opts['filter_invalid']))
+    _opts['verify_tls'] = bool(str2bool(_opts['verify_tls']))
 
     if not isinstance(req.args, list):
         raise ValueError('Non-list args to "load" not allowed')
@@ -790,7 +820,7 @@ def select(req: Plumbing.Request, *opts):
             return [item for item in lst if item is not None]
 
         def _ip_networks(elt):
-            return [ipaddr.IPNetwork(x.text) for x in elt.iter('{%s}IPHint' % NS['mdui'])]
+            return [ipaddress.ip_network(x.text) for x in elt.iter('{%s}IPHint' % NS['mdui'])]
 
         def _match(q, elt):
             q = q.strip()
@@ -798,19 +828,17 @@ def select(req: Plumbing.Request, *opts):
                 try:
                     nets = _ip_networks(elt)
                     for net in nets:
-                        if ':' in q and ipaddr.IPv6Address(q) in net:
-                            return net
-                        if '.' in q and ipaddr.IPv4Address(q) in net:
+                        if ipaddress.ip_adress(q) in net:
                             return net
                 except ValueError:
                     pass
 
             if q is not None and len(q) > 0:
                 tokens = _strings(elt)
+                p = re.compile(r'\b{}'.format(q), re.IGNORECASE)
                 for tstr in tokens:
-                    for tpart in tstr.split():
-                        if tpart.lower().startswith(q):
-                            return tstr
+                    if p.search(tstr):
+                        return tstr
             return None
 
         log.debug("matching {} in {} entities".format(match, len(entities)))
@@ -949,8 +977,69 @@ def _discojson(req: Plumbing.Request, *opts):
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
-    res = discojson_t(req.t, icon_store=req.md.icon_store)
+    res = discojson_t(req.t, req.md.rm, icon_store=req.md.icon_store)
     res.sort(key=operator.itemgetter('title'))
+
+    return json.dumps(res)
+
+
+@pipe(name='discojson_sp')
+def _discojson_sp(req, *opts):
+    """
+
+    Return a json representation of the trust information
+
+    .. code-block:: yaml
+      discojson_sp:
+
+    The returned json doc will have the following structure.
+
+    The root is a dictionary, in which the keys are the entityID's
+    of the SP entities that have trust information in their metadata,
+    and the values are a representation of that trust information.
+
+    For the XML structure of the trust information see the XML Schema
+    in this repo at `/src/pyff/schema/saml-metadata-trustinfo-v1.0.xsd`.
+
+    For each SP with trust information, the representation of
+    that information is as follows.
+
+    If there are MetadataSource elements, there will be a key
+    'extra_md' pointing to a dictionary of the metadata from those additional
+    sources, with entityIDs as keys and entities (with the format provided by
+    the discojson function above) as values.
+
+    Then there will be a key 'profiles' pointing to a dictionary
+    in which the keys are the names of the trust profiles, and the values
+    are json representations of those trust profiles.
+
+    Each trust profile will have the following keys.
+
+    If the trust profile includes a FallbackHandler element, there will
+    be a key 'fallback_handler' pointing to a dict with 2 keys, 'profile'
+    which by default is 'href', and handler which is a string, commonly a URL.
+
+    Then there will be an 'entity' key pointing to a list of representations of
+    individual trusted/untrusted entities, each of them a dictionary, with 2 keys:
+    'entity_id' pointing to a string with the entityID, and 'include',
+    pointing to a boolean.
+
+    Finally there will be a key 'entities' pointing to a list of representations
+    of groups of trusted/untrusted entities, each of them a dictionary with 3 keys:
+    a 'match' key pointing to the property of the entities by which they will be selected,
+    by default 'registrationAuthority', a key 'select' with the value that will be used
+    to select the 'match' property, and 'include', pointing to a boolean.
+
+    :param req: The request
+    :param opts: Options (unusued)
+    :return: returns a JSON doc
+
+    """
+
+    if req.t is None:
+        raise PipeException("Your pipeline is missing a select statement.")
+
+    res = discojson_sp_t(req)
 
     return json.dumps(res)
 
@@ -1156,6 +1245,42 @@ def xslt(req: Plumbing.Request, *opts):
     except Exception as ex:
         log.debug(traceback.format_exc())
         raise ex
+
+@pipe
+def indent(req: Plumbing.Request, *opts):
+    """
+
+    Transform the working document using proper indentation. Requires lxml >= 4.5
+
+    :param req: The request
+    :param opts: Options (unused)
+    :return: the transformation result
+
+    Indent the working document.
+
+    **Examples**
+
+    .. code-block:: yaml
+
+        - indent:
+            space: '    '
+
+    """
+    if req.t is None:
+        raise PipeException("Your plumbing is missing a select statement.")
+
+    if not req.args:
+        req.args = {}
+
+    if not isinstance(req.args, dict):
+        raise PipeException("usage: indent {space: '    '}")
+
+    space = req.args.get('space', '  ')
+
+    if callable(getattr(etree, 'indent', None)):
+        return etree.indent(req.t, space=space)
+    else:
+        raise PipeException("lxml version >= 4.5 required.")
 
 
 @pipe
@@ -1540,8 +1665,8 @@ def finalize(req: Plumbing.Request, *opts):
     now = utc_now()
 
     mdid = req.args.get('ID', 'prefix _')
-    if re.match('(\s)*prefix(\s)*', mdid):
-        prefix = re.sub('^(\s)*prefix(\s)*', '', mdid)
+    if re.match(r'(\s)*prefix(\s)*', mdid):
+        prefix = re.sub(r'^(\s)*prefix(\s)*', '', mdid)
         _id = now.strftime(prefix + "%Y%m%dT%H%M%SZ")
     else:
         _id = mdid

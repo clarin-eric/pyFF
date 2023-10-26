@@ -1,10 +1,9 @@
 language: python
-sudo: required
-dist: xenial
-language: python
+os: linux
+dist: jammy
 python:
-  - 3.7
-  - 3.8
+  - 3.10 
+  - 3.11
 install:
    - "pip install -r requirements.txt"
    - "pip install -r test_requirements.txt"
@@ -18,6 +17,6 @@ script:
    - make typecheck
 before_install:
    - sudo apt-get update -qq
-   - sudo apt-get install -qq python-dev libyaml-dev libxml2-dev libxslt-dev libsofthsm softhsm opensc libengine-pkcs11-openssl
+   - sudo apt-get install -qq python3-dev libyaml-dev libxml2-dev libxslt-dev libsofthsm2 rust-all softhsm opensc libengine-pkcs11-openssl
 after_success:
    coveralls
