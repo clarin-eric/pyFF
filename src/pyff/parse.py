@@ -8,7 +8,7 @@ from xmlsec.crypto import CertDict
 
 from pyff.constants import NS
 from pyff.logs import get_log
-from pyff.resource import Resource
+from pyff.resource import Resource,ResourceInfo
 from pyff.utils import find_matching_files, parse_xml, root, unicode_stream, utc_now
 
 __author__ = 'leifj'
@@ -29,6 +29,7 @@ class ParserInfo(BaseModel):
         res = {_format_key(k): v for k, v in self.dict().items()}
         return res
 
+ResourceInfo.model_rebuild()
 
 class ParserException(Exception):
     def __init__(self, msg, wrapped=None, data=None):

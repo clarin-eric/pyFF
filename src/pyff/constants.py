@@ -36,6 +36,7 @@ NS = dict(
     xsi="http://www.w3.org/2001/XMLSchema-instance",
     ser="http://eidas.europa.eu/metadata/servicelist",
     eidas="http://eidas.europa.eu/saml-extensions",
+    ti="https://seamlessaccess.org/NS/trustinfo",
 )
 
 #: These are the attribute aliases pyFF knows about. These are used to build URI paths, populate the index
@@ -555,8 +556,8 @@ def parse_options(program, docs):
                 else:
                     raise ValueError("Unknown option {}".format(o))
 
-        #if config.compat_dir and not config.base_dir:
-        #    config.base_dir = config.compat_dir
+        if config.compat_dir and not config.base_dir:
+            config.base_dir = config.compat_dir
 
     except Exception as ex:
         print(ex)
