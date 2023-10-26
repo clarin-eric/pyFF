@@ -1,9 +1,9 @@
 language: python
 os: linux
-dist: xenial
+dist: jammy
 python:
-  - 3.8
-  - 3.9
+  - 3.10 
+  - 3.11
 install:
    - "pip install -r requirements.txt"
    - "pip install -r test_requirements.txt"
