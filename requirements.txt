@@ -24,4 +24,5 @@ sphinx-pypi-upload
 whoosh
 wsgi-intercept
 xmldiff
+setuptools>=65.5.1 # not directly required, pinned by Snyk to avoid a vulnerability
 str2bool
