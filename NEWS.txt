@@ -151,3 +151,41 @@ to sign using HSMs. The only mandatory non-python dependency now is lxml.
 * Release date: tor  1 apr 2021 21:15:14 CEST
 * 1.2.0 contains several bugfixes from 1.1.5
 * 2.0.0 drops all frontend components and returns pyFFd to an API-only service
+
+2.1.0
+---
+* Release date: ons  1 nov 2023 10:17:10 CET
+* Support for metadata trust extensions
+* Multiple bug-fixes
+* Coverted to pydantic 2.4.x
+* More typing
+
+2.1.1
+-----
+* Fix MANIFEST issue that prevented install from sdist
+
+2.1.2
+-----
+* Documentation updates related to sphinx
+* Clarify semantics of trust info extension metadata
+* Fix random seeding
+* Fix for data handling related to non-Z timezones in metadata
+
+2.1.3
+-----
+* Release date: tor 14 nov 2024 14:55:01 CET
+
+* Add DiscoveryResponse info to SPs in discojson
+* Remove cherrypy imports
+* Fix logging
+* suport SP trust metadata in an entity attribute as JSON blob
+
+2.1.4
+-----
+* Release date: Tue May 27 07:29:08 CEST 2025
+
+* Lots of cleanups, pyupgrade and linting fixes. 
+* MDSL fixes
+
+2.1.5
+-----

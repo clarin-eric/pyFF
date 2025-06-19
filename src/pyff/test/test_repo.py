@@ -53,7 +53,7 @@ class TestRepo(TestCase):
         entity_id = root(self.t).get('entityID')
         set_entity_attributes(root(self.t), {"http://ns.example.org": "foo"})
         self.md.store.update(root(self.t), entity_id)
-        e = self.md.lookup("{%s}%s" % ("http://ns.example.org", 'foo'))[0]
+        e = self.md.lookup("{{{}}}{}".format("http://ns.example.org", 'foo'))[0]
         assert e is not None
         assert e.get('entityID') == entity_id
 
@@ -102,17 +102,17 @@ class TestRepo(TestCase):
 
         disp = entity_display_name(e)
         assert disp == 'Example University'
-        for elt in e.findall(".//{%s}DisplayName" % NS['mdui']):
+        for elt in e.findall(".//{{{}}}DisplayName".format(NS['mdui'])):
             elt.getparent().remove(elt)
 
         disp = entity_display_name(e)
         assert disp == 'The Example University'
-        for elt in e.findall(".//{%s}OrganizationDisplayName" % NS['md']):
+        for elt in e.findall(".//{{{}}}OrganizationDisplayName".format(NS['md'])):
             elt.getparent().remove(elt)
 
         disp = entity_display_name(e)
         assert disp == 'ExampleU'
-        for elt in e.findall(".//{%s}OrganizationName" % NS['md']):
+        for elt in e.findall(".//{{{}}}OrganizationName".format(NS['md'])):
             elt.getparent().remove(elt)
 
         disp = entity_display_name(e)
@@ -141,7 +141,7 @@ class TestRepo(TestCase):
         funet_connect = self.md.lookup('https://connect.funet.fi/shibboleth')[0]
         name, desc = entity_extended_display(funet_connect)
         assert name == 'FUNET E-Meeting Service'
-        dn = entity_extended_display(funet_connect)
+        _dn = entity_extended_display(funet_connect)
 
     def test_missing(self):
         swamid = root(self.swamid)

@@ -1,8 +1,7 @@
 import logging
+from io import StringIO
 from unittest import TestCase
-
-from mock import patch
-from six import StringIO
+from unittest.mock import patch
 
 from pyff.logs import SysLogLibHandler, log
 
@@ -50,7 +49,7 @@ class TestSyslog(TestCase):
 
     def test_bad_syslog(self):
         try:
-            bad_handler = SysLogLibHandler("SLARTIBARTIFAST")
+            _bad_handler = SysLogLibHandler("SLARTIBARTIFAST")
             assert False
         except ValueError:
             pass

@@ -1,10 +1,11 @@
 import importlib
 import threading
+from collections.abc import Generator, Iterable, Mapping
 from datetime import datetime, timedelta
 from json import dumps
-from typing import Any, Dict, Generator, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Optional
+from urllib.parse import quote_plus
 
-import pkg_resources
 import pyramid.httpexceptions as exc
 import pytz
 import requests
@@ -15,9 +16,8 @@ from pyramid.config import Configurator
 from pyramid.events import NewRequest
 from pyramid.request import Request
 from pyramid.response import Response
-from six import b
-from six.moves.urllib_parse import quote_plus
 
+from pyff import __version__
 from pyff.constants import config
 from pyff.exceptions import ResourceException
 from pyff.logs import get_log
@@ -30,8 +30,8 @@ from pyff.utils import b2u, dumptree, hash_id, json_serializer, utc_now
 log = get_log(__name__)
 
 
-class NoCache(object):
-    """ Dummy implementation for when caching isn't enabled """
+class NoCache:
+    """Dummy implementation for when caching isn't enabled"""
 
     def __init__(self) -> None:
         pass
@@ -70,7 +70,7 @@ def status_handler(request: Request) -> Response:
         if 'Validation Errors' in r.info and r.info['Validation Errors']:
             d[r.url] = r.info['Validation Errors']
     _status = dict(
-        version=pkg_resources.require("pyFF")[0].version,
+        version=__version__,
         invalids=d,
         icon_store=dict(size=request.registry.md.icon_store.size()),
         jobs=[dict(id=j.id, next_run_time=j.next_run_time) for j in request.registry.scheduler.get_jobs()],
@@ -82,7 +82,7 @@ def status_handler(request: Request) -> Response:
     return response
 
 
-class MediaAccept(object):
+class MediaAccept:
     def __init__(self, accept: str):
         self._type = AcceptableType(accept)
 
@@ -110,7 +110,7 @@ def _is_xml(data: Any) -> bool:
     return isinstance(data, (etree._Element, etree._ElementTree))
 
 
-def _fmt(data: Any, accepter: MediaAccept) -> Tuple[str, str]:
+def _fmt(data: Any, accepter: MediaAccept) -> tuple[str, str]:
     """
     Format data according to the accepted content type of the requester.
     Return data as string (either XML or json) and a content-type.
@@ -131,7 +131,6 @@ def call(entry: str) -> None:
     resp = requests.post(url)
     if resp.status_code >= 300:
         log.error(f'POST request to API endpoint at {url} failed: {resp.status_code} {resp.reason}')
-    return None
 
 
 def request_handler(request: Request) -> Response:
@@ -162,8 +161,8 @@ def process_handler(request: Request) -> Response:
     """
     _ctypes = {'xml': 'application/samlmetadata+xml;application/xml;text/xml', 'json': 'application/json'}
 
-    def _d(x: Optional[str], do_split: bool = True) -> Tuple[Optional[str], Optional[str]]:
-        """ Split a path into a base component and an extension. """
+    def _d(x: Optional[str], do_split: bool = True) -> tuple[Optional[str], Optional[str]]:
+        """Split a path into a base component and an extension."""
         if x is not None:
             x = x.strip()
 
@@ -186,7 +185,7 @@ def process_handler(request: Request) -> Response:
     if request.body:
         try:
             request.matchdict.update(request.json_body)
-        except ValueError as ex:
+        except ValueError:
             pass
 
     entry = request.matchdict.get('entry', 'request')
@@ -195,7 +194,7 @@ def process_handler(request: Request) -> Response:
 
     # Enable matching on scope.
     match = match.split('@').pop() if match and not match.endswith('@') else match
-    log.debug("match={}".format(match))
+    log.debug(f"match={match}")
 
     if not path_elem:
         path_elem = ['entities']
@@ -213,8 +212,8 @@ def process_handler(request: Request) -> Response:
     if 'entities' not in alias:
         pfx = request.registry.aliases.get(alias, None)
         if pfx is None:
-            log.debug("alias {} not found - passing to storage lookup".format(alias))
-            path=alias #treat as path
+            log.debug(f"alias {alias} not found - passing to storage lookup")
+            path = alias  # treat as path
 
     # content_negotiation_policy is one of three values:
     # 1. extension - current default, inspect the path and if it ends in
@@ -353,11 +352,11 @@ def webfinger_handler(request: Request) -> Response:
     if resource is None:
         resource = request.host_url
 
-    jrd: Dict[str, Any] = dict()
+    jrd: dict[str, Any] = dict()
     dt = datetime.now() + timedelta(hours=1)
     jrd['expires'] = dt.isoformat()
     jrd['subject'] = request.host_url
-    links: List[Dict[str, Any]] = list()
+    links: list[dict[str, Any]] = list()
     jrd['links'] = links
 
     _dflt_rels = {
@@ -377,7 +376,7 @@ def webfinger_handler(request: Request) -> Response:
             suffix = ""
             if not url.endswith('/'):
                 suffix = _dflt_rels[r][0]
-            links.append(dict(rel=r, type=_dflt_rels[r][1], href='%s/%s%s' % (request.host_url, url, suffix)))
+            links.append(dict(rel=r, type=_dflt_rels[r][1], href=f'{request.host_url}/{url}{suffix}'))
 
     _links('/entities/')
     for a in request.registry.md.store.collections():
@@ -386,12 +385,12 @@ def webfinger_handler(request: Request) -> Response:
 
     for entity in request.registry.md.store.lookup('entities'):
         entity_display = entity_display_name(entity)
-        _links("/entities/%s" % hash_id(entity.get('entityID')), title=entity_display)
+        _links("/entities/{}".format(hash_id(entity.get('entityID'))), title=entity_display)
 
     aliases = request.registry.aliases
     for a in aliases.keys():
         for v in request.registry.md.store.attribute(aliases[a]):
-            _links('%s/%s' % (a, quote_plus(v)))
+            _links(f'{a}/{quote_plus(v)}')
 
     response = Response(dumps(jrd, default=json_serializer))
     response.headers['Content-Type'] = 'application/json'
@@ -407,7 +406,7 @@ def resources_handler(request: Request) -> Response:
     :return: a JSON representation of the set of resources currently loaded by the server
     """
 
-    def _infos(resources: Iterable[Resource]) -> List[Mapping[str, Any]]:
+    def _infos(resources: Iterable[Resource]) -> list[Mapping[str, Any]]:
         return [_info(r) for r in resources if r.info.state is not None]
 
     def _info(r: Resource) -> Mapping[str, Any]:
@@ -447,25 +446,25 @@ def search_handler(request: Request) -> Response:
     :param request: the HTTP request with the 'query' request parameter
     :return: a JSON search result
     """
-    match = request.params.get('q', request.params.get('query', None))
+    match = request.params.get('q', request.params.get('query', ""))
 
     # Enable matching on scope.
     match = match.split('@').pop() if match and not match.endswith('@') else match
 
     entity_filter = request.params.get('entity_filter', '{http://pyff.io/role}idp')
-    log.debug("match={}".format(match))
+    log.debug(f"match={match}")
     store = request.registry.md.store
 
     def _response() -> Generator[bytes, bytes, None]:
-        yield b('[')
+        yield b'['
         in_loop = False
         entities = store.search(query=match.lower(), entity_filter=entity_filter)
         for e in entities:
             if in_loop:
-                yield b(',')
-            yield b(dumps(e))
+                yield b','
+            yield dumps(e)
             in_loop = True
-        yield b(']')
+        yield b']'
 
     response = Response(content_type='application/json')
     response.app_iter = _response()
@@ -478,7 +477,7 @@ def add_cors_headers_response_callback(event: NewRequest) -> None:
             {
                 'Access-Control-Allow-Origin': '*',
                 'Access-Control-Allow-Methods': 'POST,GET,DELETE,PUT,OPTIONS',
-                'Access-Control-Allow-Headers': ('Origin, Content-Type, Accept, ' 'Authorization'),
+                'Access-Control-Allow-Headers': ('Origin, Content-Type, Accept, Authorization'),
                 'Access-Control-Allow-Credentials': 'true',
                 'Access-Control-Max-Age': '1728000',
             }
@@ -487,23 +486,10 @@ def add_cors_headers_response_callback(event: NewRequest) -> None:
     event.request.add_response_callback(cors_headers)
 
 
-def launch_memory_usage_server(port: int = 9002) -> None:
-    import cherrypy
-    import dowser
-
-    cherrypy.tree.mount(dowser.Root())
-    cherrypy.config.update({'environment': 'embedded', 'server.socket_port': port})
-
-    cherrypy.engine.start()
-
-
 def mkapp(*args: Any, **kwargs: Any) -> Any:
     md = kwargs.pop('md', None)
     if md is None:
         md = MDRepository()
-
-    if config.devel_memory_profile:
-        launch_memory_usage_server()
 
     with Configurator(debug_logger=log) as ctx:
         ctx.add_subscriber(add_cors_headers_response_callback, NewRequest)

@@ -4,10 +4,9 @@ import tempfile
 from threading import Thread, current_thread
 from unittest import TestCase
 
-import six
-
 from pyff import utils
 from pyff.constants import NS, as_list_of_string
+from pyff.merge_strategies import remove, replace_existing
 from pyff.resource import Resource, ResourceOpts
 from pyff.samlmd import entities_list, find_entity
 from pyff.utils import (
@@ -23,8 +22,6 @@ from pyff.utils import (
     schema,
     url_get,
 )
-
-from pyff.merge_strategies import remove, replace_existing
 
 
 class TestMetadata(TestCase):
@@ -54,13 +51,13 @@ class TestMetadata(TestCase):
         assert idp is not None
         idp2 = copy.deepcopy(idp)
         assert idp2 is not None
-        for o in idp2.findall(".//{%s}OrganizationName" % NS['md']):
+        for o in idp2.findall(".//{{{}}}OrganizationName".format(NS['md'])):
             o.text = "FOO"
         idp2.set('ID', 'kaka4711')
         replace_existing(idp, idp2)
         idp3 = find_entity(root(self.t2), 'kaka4711', attr='ID')
         assert idp3 is not None
-        for o in idp2.findall(".//{%s}OrganizationName" % NS['md']):
+        for o in idp2.findall(".//{{{}}}OrganizationName".format(NS['md'])):
             assert o.text == "FOO"
         remove(idp3, None)
         idp = find_entity(root(self.t2), 'kaka4711', attr='ID')
@@ -88,7 +85,7 @@ class TestResources(TestCase):
             assert resource_filename(tmp) == tmp
             (d, fn) = os.path.split(tmp)
             assert resource_filename(fn, d) == tmp
-        except IOError as ex:
+        except OSError as ex:
             raise ex
         finally:
             try:
@@ -99,8 +96,8 @@ class TestResources(TestCase):
     def test_resource_string(self):
         assert resource_string("missing") is None
         assert resource_string("missing", "gone") is None
-        assert resource_string('test/data/empty.txt') == six.b('empty')
-        assert resource_string('empty.txt', 'test/data') == six.b('empty')
+        assert resource_string('test/data/empty.txt') == b'empty'
+        assert resource_string('empty.txt', 'test/data') == b'empty'
         tmp = tempfile.NamedTemporaryFile('w').name
         with open(tmp, "w") as fd:
             fd.write("test")
@@ -110,7 +107,7 @@ class TestResources(TestCase):
             assert resource_string(tmp) == 'test'
             (d, fn) = os.path.split(tmp)
             assert resource_string(fn, d) == 'test'
-        except IOError as ex:
+        except OSError as ex:
             raise ex
         finally:
             try:
@@ -192,7 +189,7 @@ class TestLambda(TestCase):
         try:
             f("foo")
             assert False
-        except AssertionError as ex:
+        except AssertionError:
             pass
 
 
@@ -212,7 +209,7 @@ class TestImage(TestCase):
             (basename, _, ext) = fn.rpartition('.')
             mime_type = TestImage.ext_to_mime.get(ext, None)
             assert mime_type is not None
-            url = "file://{}".format(fn)
+            url = f"file://{fn}"
             assert url
             r = url_get(url)
             assert r

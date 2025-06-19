@@ -5,16 +5,8 @@ import os
 import syslog
 from typing import Any, Optional
 
-import six
 
-try:
-    import cherrypy
-except ImportError as e:
-    logging.debug("cherrypy logging disabled")
-    cherrypy = None
-
-
-class PyFFLogger(object):
+class PyFFLogger:
     def __init__(self, name=None):
         if name is None:
             name = __name__
@@ -29,12 +21,10 @@ class PyFFLogger(object):
         }
 
     def _l(self, severity, msg):
-        if cherrypy is not None and '' in cherrypy.tree.apps:
-            cherrypy.tree.apps[''].log(str(msg), severity=severity)
-        elif severity in self._loggers:
+        if severity in self._loggers:
             self._loggers[severity](str(msg))
         else:
-            raise ValueError("unknown severity %s" % severity)
+            raise ValueError(f"unknown severity {severity}")
 
     def warn(self, msg: str) -> Any:
         return self._l(logging.WARN, msg)
@@ -72,7 +62,7 @@ def log_config_file(ini: Optional[str]) -> None:
         if not os.path.isabs(ini):
             ini = os.path.join(os.getcwd(), ini)
         if not os.path.exists(ini):
-            raise ValueError("PYFF_LOGGING={} does not exist".format(ini))
+            raise ValueError(f"PYFF_LOGGING={ini} does not exist")
         logging.config.fileConfig(ini)
 
 
@@ -96,10 +86,10 @@ class SysLogLibHandler(logging.Handler):
 
     def __init__(self, facility):
 
-        if isinstance(facility, six.string_types):
-            nf = getattr(syslog, "LOG_%s" % facility.upper(), None)
+        if isinstance(facility, str):
+            nf = getattr(syslog, f"LOG_{facility.upper()}", None)
             if not isinstance(nf, int):
-                raise ValueError('Invalid log facility: %s' % nf)
+                raise ValueError(f'Invalid log facility: {nf}')
             self.facility = nf
         else:
             self.facility = facility

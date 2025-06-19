@@ -1,23 +1,23 @@
+import json
 import traceback
+from base64 import b64decode
 from copy import deepcopy
 from datetime import datetime, timedelta
-from str2bool import str2bool
 from io import BytesIO
 from itertools import chain
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 from lxml import etree
 from lxml.builder import ElementMaker
 from lxml.etree import DocumentInvalid, Element, ElementTree
 from pydantic import Field
+from str2bool import str2bool
 from xmlsec.crypto import CertDict
-from .resource import Resource, ResourceHandler, ResourceOpts
 
 from pyff.constants import ATTRS, NF_URI, NS, config
-from pyff.exceptions import *
+from pyff.exceptions import MetadataException
 from pyff.logs import get_log
 from pyff.parse import ParserInfo, PyffParser, add_parser
-from pyff.resource import Resource, ResourceOpts
 from pyff.utils import (
     Lambda,
     b2u,
@@ -45,10 +45,12 @@ from pyff.utils import (
     xml_error,
 )
 
+from .resource import Resource, ResourceOpts
+
 log = get_log(__name__)
 
 
-class EntitySet(object):
+class EntitySet:
     def __init__(self, initial=None):
         self._e = dict()
         if initial is not None:
@@ -64,8 +66,7 @@ class EntitySet(object):
             del self._e[entity_id]
 
     def __iter__(self):
-        for e in list(self._e.values()):
-            yield e
+        yield from list(self._e.values())
 
     def __len__(self):
         return len(list(self._e.keys()))
@@ -76,7 +77,7 @@ class EntitySet(object):
 
 def find_merge_strategy(strategy_name):
     if '.' not in strategy_name:
-        strategy_name = "pyff.merge_strategies:%s" % strategy_name
+        strategy_name = f"pyff.merge_strategies:{strategy_name}"
     if ':' not in strategy_name:
         # TODO: BUG: Parameter 'occurrence' unfilled
         strategy_name = rreplace(strategy_name, '.', ':')  # backwards compat for old way of specifying these
@@ -84,7 +85,10 @@ def find_merge_strategy(strategy_name):
 
 
 def parse_saml_metadata(
-    source: BytesIO, opts: ResourceOpts, base_url=None, validation_errors: Optional[Dict[str, Any]] = None,
+    source: BytesIO,
+    opts: ResourceOpts,
+    base_url=None,
+    validation_errors: Optional[dict[str, Any]] = None,
 ):
     """Parse a piece of XML and return an EntitiesDescriptor element after validation.
 
@@ -109,7 +113,7 @@ def parse_saml_metadata(
         t = check_signature(t, opts.verify)
 
         trust_info = None
-        extensions = t.find('{%s}Extensions' % NS['md'])
+        extensions = t.find('{{{}}}Extensions'.format(NS['md']))
 
         if opts.cleanup is not None:
             for cb in opts.cleanup:
@@ -131,16 +135,16 @@ def parse_saml_metadata(
             )
 
         if t is not None:
-            if t.tag == "{%s}EntityDescriptor" % NS['md']:
+            if t.tag == "{{{}}}EntityDescriptor".format(NS['md']):
                 t = entitiesdescriptor(
                     [t], base_url, copy=False, validate=True, filter_invalid=filter_invalid, nsmap=t.nsmap
                 )
-            elif t.tag == "{%s}EntitiesDescriptor" % NS['md'] and extensions is not None:
+            elif t.tag == "{{{}}}EntitiesDescriptor".format(NS['md']) and extensions is not None:
                 trust_info = discojson_sp(extensions)
 
     except Exception as ex:
         log.debug(traceback.format_exc())
-        log.error("Error parsing {}: {}".format(base_url, ex))
+        log.error(f"Error parsing {base_url}: {ex}")
         if opts.fail_on_error:
             raise ex
 
@@ -152,7 +156,7 @@ def parse_saml_metadata(
 
 
 class SAMLParserInfo(ParserInfo):
-    entities: List[str] = Field([])  # list of entity ids
+    entities: list[str] = Field([])  # list of entity ids
 
 
 class SAMLMetadataResourceParser(PyffParser):
@@ -182,18 +186,20 @@ class SAMLMetadataResourceParser(PyffParser):
             resource.expire_time = expire_time
             info.expiration_time = str(expire_time)
 
-        def _extra_md(_t, info, **kwargs):
+        def _extra_md(_t, resource_opts, **kwargs):
             entityID = kwargs.get('entityID')
-            if info['alias'] != entityID:
+            if resource_opts['alias'] != entityID:
                 return _t
             sp_entities = kwargs.get('sp_entities')
             location = kwargs.get('location')
-            sp_entity = sp_entities.find("{%s}EntityDescriptor[@entityID='%s']" % (NS['md'], entityID))
+            sp_entity = sp_entities.find("{{{}}}EntityDescriptor[@entityID='{}']".format(NS['md'], entityID))
             if sp_entity is not None:
-                md_source = sp_entity.find("{%s}SPSSODescriptor/{%s}Extensions/{%s}TrustInfo/{%s}MetadataSource[@src='%s']" % (NS['md'], NS['md'], NS['ti'], NS['ti'], location))
+                md_source = sp_entity.find(
+                    "{{{}}}SPSSODescriptor/{{{}}}Extensions/{{{}}}TrustInfo/{{{}}}MetadataSource[@src='{}']".format(NS['md'], NS['md'], NS['ti'], NS['ti'], location)
+                )
                 for e in iter_entities(_t):
                     md_source.append(e)
-            return etree.Element("{%s}EntitiesDescriptor" % NS['md'])
+            return etree.Element("{{{}}}EntitiesDescriptor".format(NS['md']))
 
         if t is not None:
             resource.t = t
@@ -203,11 +209,14 @@ class SAMLMetadataResourceParser(PyffParser):
                 entityID = e.get('entityID')
                 info.entities.append(entityID)
 
-                md_source = e.find("{%s}SPSSODescriptor/{%s}Extensions/{%s}TrustInfo/{%s}MetadataSource" % (NS['md'], NS['md'], NS['ti'], NS['ti']))
+                md_source = e.find(
+                    "{{{}}}SPSSODescriptor/{{{}}}Extensions/{{{}}}TrustInfo/{{{}}}MetadataSource".format(NS['md'], NS['md'], NS['ti'], NS['ti'])
+                )
                 if md_source is not None:
                     location = md_source.attrib.get('src')
                     if location is not None:
-                        child_opts = resource.opts.copy(update={'alias': entityID})
+                        child_opts = resource.opts.model_copy(update={'alias': entityID}, deep=True)
+
                         r = resource.add_child(location, child_opts)
                         kwargs = {
                             'entityID': entityID,
@@ -251,7 +260,7 @@ class EidasMDParserInfo(ParserInfo):
             # Turn expiration_time into 'Expiration Time'
             return k.replace('_', ' ').title()
 
-        res = {_format_key(k): v for k, v in self.dict().items()}
+        res = {_format_key(k): v for k, v in self.model_dump().items()}
         return res
 
 
@@ -285,11 +294,11 @@ class MDServiceListParser(PyffParser):
             resource.expire_time = info.next_update
 
         info.expiration_time = 'None' if not resource.expire_time else resource.expire_time.isoformat()
-        info.issuer_name = first_text(relt, "{%s}IssuerName" % NS['ser'])
-        info.scheme_identifier = first_text(relt, "{%s}SchemeIdentifier" % NS['ser'])
-        info.scheme_territory = first_text(relt, "{%s}SchemeTerritory" % NS['ser'])
-        for mdl in relt.iter("{%s}MetadataList" % NS['ser']):
-            for ml in mdl.iter("{%s}MetadataLocation" % NS['ser']):
+        info.issuer_name = first_text(relt, "{{{}}}IssuerName".format(NS['ser']))
+        info.scheme_identifier = first_text(relt, "{{{}}}SchemeIdentifier".format(NS['ser']))
+        info.scheme_territory = first_text(relt, "{{{}}}SchemeTerritory".format(NS['ser']))
+        for mdl in relt.iter("{{{}}}MetadataList".format(NS['ser'])):
+            for ml in mdl.iter("{{{}}}MetadataLocation".format(NS['ser'])):
                 location = ml.get('Location')
                 if location:
                     certs = CertDict(ml)
@@ -298,7 +307,7 @@ class MDServiceListParser(PyffParser):
                     if len(fingerprints) > 0:
                         fp = fingerprints[0]
 
-                    ep = ml.find("{%s}Endpoint" % NS['ser'])
+                    ep = ml.find("{{{}}}Endpoint".format(NS['ser']))
                     if ep is not None and fp is not None:
                         args = dict(
                             country_code=mdl.get('Territory'),
@@ -309,12 +318,12 @@ class MDServiceListParser(PyffParser):
                                 info.scheme_territory, location, fp, args.get('country_code')
                             )
                         )
-                        child_opts = resource.opts.copy(update={'alias': None})
+                        child_opts = resource.opts.model_copy(update={'alias': None}, deep=True)
                         child_opts.verify = fp
                         r = resource.add_child(location, child_opts)
 
                         # this is specific post-processing for MDSL files
-                        def _update_entities(_t, **kwargs):
+                        def _update_entities(_t, resource_opts, **kwargs):
                             _country_code = kwargs.get('country_code')
                             _hide_from_discovery = kwargs.get('hide_from_discovery')
                             for e in iter_entities(_t):
@@ -339,13 +348,13 @@ add_parser(MDServiceListParser())
 
 def metadata_expiration(t: ElementTree) -> Optional[timedelta]:
     relt = root(t)
-    if relt.tag in ('{%s}EntityDescriptor' % NS['md'], '{%s}EntitiesDescriptor' % NS['md']):
+    if relt.tag in ('{{{}}}EntityDescriptor'.format(NS['md']), '{{{}}}EntitiesDescriptor'.format(NS['md'])):
         cache_duration = config.default_cache_duration
         valid_until = relt.get('validUntil', None)
         if valid_until is not None:
-            now = utc_now().replace(microsecond=0)
+            now = utc_now().replace(microsecond=0).replace(tzinfo=None)
             vu = iso2datetime(valid_until)
-            vu = vu.replace(microsecond=0)
+            vu = vu.replace(microsecond=0).replace(tzinfo=None)
             return vu - now
         elif config.respect_cache_duration:
             cache_duration = relt.get('cacheDuration', config.default_cache_duration)
@@ -360,10 +369,10 @@ def filter_invalids_from_document(t: ElementTree, base_url, validation_errors) -
     xsd = schema()
     for e in iter_entities(t):
         if not xsd.validate(e):
-            error = xml_error(xsd.error_log, m=base_url)
+            _error = xml_error(xsd.error_log, m=base_url)
             entity_id = e.get("entityID", "(Missing entityID)")
-            log.warning('removing \'%s\': schema validation failed: %s' % (entity_id, xsd.error_log))
-            validation_errors[entity_id] = "{}".format(xsd.error_log)
+            log.warning(f'removing \'{entity_id}\': schema validation failed: {xsd.error_log}')
+            validation_errors[entity_id] = f"{xsd.error_log}"
             if e.getparent() is None:
                 return None
             e.getparent().remove(e)
@@ -375,32 +384,30 @@ def filter_or_validate(
     filter_invalid: bool = False,
     base_url: str = "",
     source=None,
-    validation_errors: Optional[Dict[str, Any]] = None,
+    validation_errors: Optional[dict[str, Any]] = None,
 ) -> ElementTree:
     if validation_errors is None:
         validation_errors = {}
-    log.debug("Filtering invalids from {}".format(base_url))
+    log.debug(f"Filtering invalids from {base_url}")
     if filter_invalid:
         t = filter_invalids_from_document(t, base_url=base_url, validation_errors=validation_errors)
         for entity_id, err in validation_errors.items():
             log.error(
-                "Validation error while parsing {} (from {}). Removed @entityID='{}': {}".format(
-                    base_url, source, entity_id, err
-                )
+                f"Validation error while parsing {base_url} (from {source}). Removed @entityID='{entity_id}': {err}"
             )
     else:  # all or nothing
-        log.debug("Validating (one-shot) {}".format(base_url))
+        log.debug(f"Validating (one-shot) {base_url}")
         try:
             validate_document(t)
         except DocumentInvalid as ex:
             err = xml_error(ex.error_log, m=base_url)
             validation_errors[base_url] = err
-            raise MetadataException("Validation error while parsing {}: (from {}): {}".format(base_url, source, err))
+            raise MetadataException(f"Validation error while parsing {base_url}: (from {source}): {err}")
 
     return t
 
 
-def resolve_entities(entities, lookup_fn=None):
+def resolve_entities(entities, lookup_fn=None, dedup=True):
     """
 
     :param entities: a set of entities specifiers (lookup is used to find entities from this set)
@@ -414,13 +421,21 @@ def resolve_entities(entities, lookup_fn=None):
         else:
             return l_fn(m)
 
-    resolved_entities = dict()  # a set won't do since __compare__ doesn't use @entityID
+    if dedup:
+        resolved_entities = dict()  # a set won't do since __compare__ doesn't use @entityID
+    else:
+        resolved_entities = []
     for member in entities:
         for entity in _resolve(member, lookup_fn):
             entity_id = entity.get('entityID', None)
             if entity is not None and entity_id is not None:
-                resolved_entities[entity_id] = entity
-    return resolved_entities.values()
+                if dedup:
+                    resolved_entities[entity_id] = entity
+                else:
+                    resolved_entities.append(entity)
+    if dedup:
+        return resolved_entities.values()
+    return resolved_entities
 
 
 def entitiesdescriptor(
@@ -466,7 +481,7 @@ def entitiesdescriptor(
         attrs['cacheDuration'] = cache_duration
     if valid_until is not None:
         attrs['validUntil'] = valid_until
-    t = etree.Element("{%s}EntitiesDescriptor" % NS['md'], **attrs)
+    t = etree.Element("{{{}}}EntitiesDescriptor".format(NS['md']), **attrs)
     for entity in entities:
         ent_insert = entity
         if copy:
@@ -476,7 +491,7 @@ def entitiesdescriptor(
     if config.devel_write_xml_to_file:
         import os
 
-        with open("/tmp/pyff_entities_out-{}.xml".format(os.getpid()), "w") as fd:
+        with open(f"/tmp/pyff_entities_out-{os.getpid()}.xml", "w") as fd:
             fd.write(b2u(dumptree(t)))
 
     if validate:
@@ -486,7 +501,7 @@ def entitiesdescriptor(
         )
 
         for base_url, err in validation_errors.items():
-            log.error("Validation error: @ {}: {}".format(base_url, err))
+            log.error(f"Validation error: @ {base_url}: {err}")
 
     return t
 
@@ -499,7 +514,7 @@ def entities_list(t=None):
     """
     if t is None:
         return []
-    elif root(t).tag == "{%s}EntityDescriptor" % NS['md']:
+    elif root(t).tag == "{{{}}}EntityDescriptor".format(NS['md']):
         return [root(t)]
     else:
         return iter_entities(t)
@@ -508,7 +523,7 @@ def entities_list(t=None):
 def iter_entities(t):
     if t is None:
         return []
-    return t.iter('{%s}EntityDescriptor' % NS['md'])
+    return t.iter('{{{}}}EntityDescriptor'.format(NS['md']))
 
 
 def find_entity(t, e_id, attr='entityID'):
@@ -522,7 +537,7 @@ def find_entity(t, e_id, attr='entityID'):
 # many thanks to Anders Lordahl & Scotty Logan for the idea
 def guess_entity_software(e):
     for elt in chain(
-        e.findall(".//{%s}SingleSignOnService" % NS['md']), e.findall(".//{%s}AssertionConsumerService" % NS['md'])
+        e.findall(".//{{{}}}SingleSignOnService".format(NS['md'])), e.findall(".//{{{}}}AssertionConsumerService".format(NS['md']))
     ):
         location = elt.get('Location')
         if location:
@@ -537,7 +552,7 @@ def guess_entity_software(e):
                 return 'SimpleSAMLphp'
             if location.endswith('user/authenticate'):
                 return 'KalturaSSP'
-            if location.endswith('adfs/ls') or location.endswith('adfs/ls/'):
+            if location.endswith(('adfs/ls', 'adfs/ls/')):
                 return 'ADFS'
             if '/oala/' in location or 'login.openathens.net' in location:
                 return 'OpenAthens'
@@ -585,20 +600,20 @@ def guess_entity_software(e):
 
 
 def is_idp(entity):
-    return has_tag(entity, "{%s}IDPSSODescriptor" % NS['md'])
+    return has_tag(entity, "{{{}}}IDPSSODescriptor".format(NS['md']))
 
 
 def is_sp(entity):
-    return has_tag(entity, "{%s}SPSSODescriptor" % NS['md'])
+    return has_tag(entity, "{{{}}}SPSSODescriptor".format(NS['md']))
 
 
 def is_aa(entity):
-    return has_tag(entity, "{%s}AttributeAuthorityDescriptor" % NS['md'])
+    return has_tag(entity, "{{{}}}AttributeAuthorityDescriptor".format(NS['md']))
 
 
 def _domains(entity):
     domains = [url2host(entity.get('entityID'))]
-    for d in entity.iter("{%s}DomainHint" % NS['mdui']):
+    for d in entity.iter("{{{}}}DomainHint".format(NS['mdui'])):
         if d.text not in domains:
             domains.append(d.text)
     return domains
@@ -609,11 +624,11 @@ def with_entity_attributes(entity, cb):
         if e.text is not None:
             return e.text.strip()
 
-    for ea in entity.iter("{%s}EntityAttributes" % NS['mdattr']):
-        for a in ea.iter("{%s}Attribute" % NS['saml']):
+    for ea in entity.iter("{{{}}}EntityAttributes".format(NS['mdattr'])):
+        for a in ea.iter("{{{}}}Attribute".format(NS['saml'])):
             an = a.get('Name', None)
             if a is not None:
-                values = [x for x in [_stext(v) for v in a.iter("{%s}AttributeValue" % NS['saml'])] if x is not None]
+                values = [x for x in [_stext(v) for v in a.iter("{{{}}}AttributeValue".format(NS['saml']))] if x is not None]
                 cb(an, values)
 
 
@@ -652,7 +667,7 @@ def find_in_document(t, member):
                 if e.get('entityID') == member:
                     lst.append(e)
             return lst
-    raise MetadataException("unknown format for filtr member: %s" % member)
+    raise MetadataException(f"unknown format for filtr member: {member}")
 
 
 def entity_attribute_dict(entity):
@@ -684,28 +699,28 @@ def entity_attribute_dict(entity):
 
 
 def gen_icon(e):
-    scopes = entity_scopes(e)
+    _scopes = entity_scopes(e)
 
 
 def entity_icon_url(e, langs=None):
-    for ico in filter_lang(e.iter("{%s}Logo" % NS['mdui']), langs=langs):
+    for ico in filter_lang(e.iter("{{{}}}Logo".format(NS['mdui'])), langs=langs):
         return dict(url=ico.text, width=ico.get('width'), height=ico.get('height'))
 
 
 def privacy_statement_url(entity, langs):
-    for url in filter_lang(entity.iter("{%s}PrivacyStatementURL" % NS['mdui']), langs=langs):
+    for url in filter_lang(entity.iter("{{{}}}PrivacyStatementURL".format(NS['mdui'])), langs=langs):
         return url.text
 
 
 def entity_geoloc(entity):
-    for loc in entity.iter("{%s}GeolocationHint" % NS['mdui']):
+    for loc in entity.iter("{{{}}}GeolocationHint".format(NS['mdui'])):
         pos = loc.text[5:].split(",")
         return dict(lat=pos[0], long=pos[1])
 
 
 def entity_domains(entity):
     domains = []
-    for d in entity.iter("{%s}DomainHint" % NS['mdui']):
+    for d in entity.iter("{{{}}}DomainHint".format(NS['mdui'])):
         if d.text == '.':
             return []
         domains.append(d.text)
@@ -715,19 +730,18 @@ def entity_domains(entity):
 
 
 def entity_extended_display_i18n(entity, default_lang=None):
-
-    name_dict = lang_dict(entity.iter("{%s}OrganizationName" % NS['md']), lambda e: e.text, default_lang=default_lang)
+    name_dict = lang_dict(entity.iter("{{{}}}OrganizationName".format(NS['md'])), lambda e: e.text, default_lang=default_lang)
     name_dict.update(
-        lang_dict(entity.iter("{%s}OrganizationDisplayName" % NS['md']), lambda e: e.text, default_lang=default_lang)
+        lang_dict(entity.iter("{{{}}}OrganizationDisplayName".format(NS['md'])), lambda e: e.text, default_lang=default_lang)
     )
-    name_dict.update(lang_dict(entity.iter("{%s}ServiceName" % NS['md']), lambda e: e.text, default_lang=default_lang))
+    name_dict.update(lang_dict(entity.iter("{{{}}}ServiceName".format(NS['md'])), lambda e: e.text, default_lang=default_lang))
     name_dict.update(
-        lang_dict(entity.iter("{%s}DisplayName" % NS['mdui']), lambda e: e.text, default_lang=default_lang)
+        lang_dict(entity.iter("{{{}}}DisplayName".format(NS['mdui'])), lambda e: e.text, default_lang=default_lang)
     )
 
-    desc_dict = lang_dict(entity.iter("{%s}OrganizationURL" % NS['md']), lambda e: e.text, default_lang=default_lang)
+    desc_dict = lang_dict(entity.iter("{{{}}}OrganizationURL".format(NS['md'])), lambda e: e.text, default_lang=default_lang)
     desc_dict.update(
-        lang_dict(entity.iter("{%s}Description" % NS['mdui']), lambda e: e.text, default_lang=default_lang)
+        lang_dict(entity.iter("{{{}}}Description".format(NS['mdui'])), lambda e: e.text, default_lang=default_lang)
     )
 
     return name_dict, desc_dict
@@ -736,8 +750,7 @@ def entity_extended_display_i18n(entity, default_lang=None):
 def entity_attribute(entity, attribute):
     values = None
     els = entity.findall(
-        './/{%s}EntityAttributes/{%s}Attribute[@Name="%s"]/{%s}AttributeValue'
-        % (NS['mdattr'], NS['saml'], attribute, NS['saml'])
+        './/{{{}}}EntityAttributes/{{{}}}Attribute[@Name="{}"]/{{{}}}AttributeValue'.format(NS['mdattr'], NS['saml'], attribute, NS['saml'])
     )
     if len(els) > 0:
         values = [el.text for el in els]
@@ -747,8 +760,7 @@ def entity_attribute(entity, attribute):
 def entity_categories(entity):
     cats = None
     cats_els = entity.findall(
-        './/{%s}EntityAttributes/{%s}Attribute[@Name="http://macedir.org/entity-category"]/{%s}AttributeValue'
-        % (NS['mdattr'], NS['saml'], NS['saml'])
+        './/{{{}}}EntityAttributes/{{{}}}Attribute[@Name="http://macedir.org/entity-category"]/{{{}}}AttributeValue'.format(NS['mdattr'], NS['saml'], NS['saml'])
     )
     if len(cats_els) > 0:
         cats = [el.text for el in cats_els]
@@ -758,8 +770,7 @@ def entity_categories(entity):
 def assurance_cetification(entity):
     certs = None
     certs_els = entity.findall(
-        './/{%s}EntityAttributes/{%s}Attribute[@Name="urn:oasis:names:tc:SAML:attribute:assurance-certification"]/{%s}AttributeValue'
-        % (NS['mdattr'], NS['saml'], NS['saml'])
+        './/{{{}}}EntityAttributes/{{{}}}Attribute[@Name="urn:oasis:names:tc:SAML:attribute:assurance-certification"]/{{{}}}AttributeValue'.format(NS['mdattr'], NS['saml'], NS['saml'])
     )
     if len(certs_els) > 0:
         certs = [el.text for el in certs_els]
@@ -769,8 +780,7 @@ def assurance_cetification(entity):
 def entity_category_support(entity):
     cats = None
     cats_els = entity.findall(
-        './/{%s}EntityAttributes/{%s}Attribute[@Name="http://macedir.org/entity-category-support"]/{%s}AttributeValue'
-        % (NS['mdattr'], NS['saml'], NS['saml'])
+        './/{{{}}}EntityAttributes/{{{}}}Attribute[@Name="http://macedir.org/entity-category-support"]/{{{}}}AttributeValue'.format(NS['mdattr'], NS['saml'], NS['saml'])
     )
     if len(cats_els) > 0:
         cats = [el.text for el in cats_els]
@@ -778,9 +788,17 @@ def entity_category_support(entity):
 
 
 def registration_authority(entity):
-    regauth_el = entity.find(".//{%s}RegistrationInfo" % NS['mdrpi'])
+    regauth_el = entity.find(".//{{{}}}RegistrationInfo".format(NS['mdrpi']))
     if regauth_el is not None:
         return regauth_el.attrib.get('registrationAuthority')
+
+
+def discovery_responses(entity):
+    responses = None
+    responses_els = entity.findall(".//{{{}}}DiscoveryResponse".format(NS['idpdisc']))
+    if len(responses_els) > 0:
+        responses = [el.attrib.get('Location') for el in responses_els]
+    return responses
 
 
 def entity_extended_display(entity, langs=None):
@@ -792,31 +810,31 @@ def entity_extended_display(entity, langs=None):
     display = entity.get('entityID')
     info = ''
 
-    for organizationName in filter_lang(entity.iter("{%s}OrganizationName" % NS['md']), langs=langs):
+    for organizationName in filter_lang(entity.iter("{{{}}}OrganizationName".format(NS['md'])), langs=langs):
         info = display
         display = organizationName.text
         break
 
-    for organizationDisplayName in filter_lang(entity.iter("{%s}OrganizationDisplayName" % NS['md']), langs=langs):
+    for organizationDisplayName in filter_lang(entity.iter("{{{}}}OrganizationDisplayName".format(NS['md'])), langs=langs):
         info = display
         display = organizationDisplayName.text
         break
 
-    for serviceName in filter_lang(entity.iter("{%s}ServiceName" % NS['md']), langs=langs):
+    for serviceName in filter_lang(entity.iter("{{{}}}ServiceName".format(NS['md'])), langs=langs):
         info = display
         display = serviceName.text
         break
 
-    for displayName in filter_lang(entity.iter("{%s}DisplayName" % NS['mdui']), langs=langs):
+    for displayName in filter_lang(entity.iter("{{{}}}DisplayName".format(NS['mdui'])), langs=langs):
         info = display
         display = displayName.text
         break
 
-    for organizationUrl in filter_lang(entity.iter("{%s}OrganizationURL" % NS['md']), langs=langs):
+    for organizationUrl in filter_lang(entity.iter("{{{}}}OrganizationURL".format(NS['md'])), langs=langs):
         info = organizationUrl.text
         break
 
-    for description in filter_lang(entity.iter("{%s}Description" % NS['mdui']), langs=langs):
+    for description in filter_lang(entity.iter("{{{}}}Description".format(NS['mdui'])), langs=langs):
         info = description.text
         break
 
@@ -832,16 +850,16 @@ def entity_display_name(entity: Element, langs=None) -> str:
     :param entity: An EntityDescriptor element
     :param langs: The list of languages to search in priority order
     """
-    for displayName in filter_lang(entity.iter("{%s}DisplayName" % NS['mdui']), langs=langs):
+    for displayName in filter_lang(entity.iter("{{{}}}DisplayName".format(NS['mdui'])), langs=langs):
         return displayName.text.strip()
 
-    for serviceName in filter_lang(entity.iter("{%s}ServiceName" % NS['md']), langs=langs):
+    for serviceName in filter_lang(entity.iter("{{{}}}ServiceName".format(NS['md'])), langs=langs):
         return serviceName.text.strip()
 
-    for organizationDisplayName in filter_lang(entity.iter("{%s}OrganizationDisplayName" % NS['md']), langs=langs):
+    for organizationDisplayName in filter_lang(entity.iter("{{{}}}OrganizationDisplayName".format(NS['md'])), langs=langs):
         return organizationDisplayName.text.strip()
 
-    for organizationName in filter_lang(entity.iter("{%s}OrganizationName" % NS['md']), langs=langs):
+    for organizationName in filter_lang(entity.iter("{{{}}}OrganizationName".format(NS['md'])), langs=langs):
         return organizationName.text.strip()
 
     return entity.get('entityID').strip()
@@ -858,7 +876,7 @@ def sub_domains(e):
 
 
 def entity_scopes(e):
-    elt = e.findall('.//{%s}IDPSSODescriptor/{%s}Extensions/{%s}Scope' % (NS['md'], NS['md'], NS['shibmd']))
+    elt = e.findall('.//{{{}}}IDPSSODescriptor/{{{}}}Extensions/{{{}}}Scope'.format(NS['md'], NS['md'], NS['shibmd']))
     if elt is None or len(elt) == 0:
         return None
     return [s.text for s in elt]
@@ -875,6 +893,7 @@ def discojson(e, sources=None, langs=None, fallback_to_favicon=False, icon_store
     categories = entity_attribute(e, "http://macedir.org/entity-category")
     certifications = entity_attribute(e, "urn:oasis:names:tc:SAML:attribute:assurance-certification")
     cat_support = entity_attribute(e, "http://macedir.org/entity-category-support")
+    disc_responses = discovery_responses(e)
 
     d = dict(
         title=title,
@@ -900,6 +919,9 @@ def discojson(e, sources=None, langs=None, fallback_to_favicon=False, icon_store
     if sources is not None:
         d['md_source'] = sources
 
+    if disc_responses is not None:
+        d["discovery_responses"] = disc_responses
+
     eattr = entity_attribute_dict(e)
     if 'idp' in eattr[ATTRS['role']]:
         d['type'] = 'idp'
@@ -924,7 +946,7 @@ def discojson(e, sources=None, langs=None, fallback_to_favicon=False, icon_store
                 icon_info['url'] = ico
         d['entity_icon_url'] = icon_info
 
-    keywords = filter_lang(e.iter("{%s}Keywords" % NS['mdui']), langs=langs)
+    keywords = filter_lang(e.iter("{{{}}}Keywords".format(NS['mdui'])), langs=langs)
     if keywords is not None:
         lst = [elt.text for elt in keywords]
         if len(lst) > 0:
@@ -953,53 +975,57 @@ def discojson_t(t, resource, icon_store=None):
 def discojson_sp(e, global_trust_info=None, global_md_sources=None):
     sp = {}
 
-    tinfo_el = e.find('.//{%s}TrustInfo' % NS['ti'])
+    tinfo_el = e.find('.//{{{}}}TrustInfo'.format(NS['ti']))
     if tinfo_el is None:
         return None
 
     sp['entityID'] = e.get('entityID', None)
 
-    md_sources = e.findall("{%s}SPSSODescriptor/{%s}Extensions/{%s}TrustInfo/{%s}MetadataSource" % (NS['md'], NS['md'], NS['ti'], NS['ti']))
+    md_sources = e.findall(
+        "{{{}}}SPSSODescriptor/{{{}}}Extensions/{{{}}}TrustInfo/{{{}}}MetadataSource".format(
+            NS['md'], NS['md'], NS['ti'], NS['ti']
+        )
+    )
 
     sp['extra_md'] = {}
     for md_source in md_sources:
         dname_external = {}
-        for dname in md_source.iterfind('.//{%s}DisplayName' % NS['ti']):
-            lang = dname.attrib['{%s}lang' % NS['xml']]
+        for dname in md_source.iterfind('.//{{{}}}DisplayName'.format(NS['ti'])):
+            lang = dname.attrib['{{{}}}lang'.format(NS['xml'])]
             dname_external[lang] = dname.text
 
-        for idp in md_source.findall("{%s}EntityDescriptor" % NS['md']):
+        for idp in md_source.findall("{{{}}}EntityDescriptor".format(NS['md'])):
             idp_json = discojson(idp)
-            idp_json['trusted'] = dname_external
+            idp_json['hint'] = dname_external
             sp['extra_md'][idp_json['entityID']] = idp_json
 
     sp['profiles'] = {}
     # Grab trust profile emements, and translate to json
-    for profile_el in tinfo_el.findall('.//{%s}TrustProfile' % NS['ti']):
+    for profile_el in tinfo_el.findall('.//{{{}}}TrustProfile'.format(NS['ti'])):
         name = profile_el.attrib['name']
         strict = profile_el.attrib.get('strict', True)
         strict = strict if type(strict) is bool else strict in ('t', 'T', 'true', 'True')
         sp['profiles'][name] = {'strict': strict, 'entity': [], 'entities': []}
 
         display_name = {}
-        for dname in profile_el.iterfind('.//{%s}DisplayName' % NS['ti']):
-            lang = dname.attrib['{%s}lang' % NS['xml']]
+        for dname in profile_el.iterfind('.//{{{}}}DisplayName'.format(NS['ti'])):
+            lang = dname.attrib['{{{}}}lang'.format(NS['xml'])]
             display_name[lang] = dname.text
         sp['profiles'][name]['display_name'] = display_name
 
-        fallback_handler = profile_el.find('.//{%s}FallbackHandler' % NS['ti'])
+        fallback_handler = profile_el.find('.//{{{}}}FallbackHandler'.format(NS['ti']))
         if fallback_handler is not None:
             prof = fallback_handler.attrib.get('profile', 'href')
             handler = fallback_handler.text
             sp['profiles'][name]['fallback_handler'] = {'profile': prof, 'handler': handler}
 
-        for entity_el in profile_el.findall('.//{%s}TrustedEntity' % NS['ti']):
+        for entity_el in profile_el.findall('.//{{{}}}TrustedEntity'.format(NS['ti'])):
             entity_id = entity_el.text
             include = entity_el.attrib.get('include', True)
             include = include if type(include) is bool else include in ('t', 'T', 'true', 'True')
             sp['profiles'][name]['entity'].append({'entity_id': entity_id, 'include': include})
 
-        for entities_el in profile_el.findall('.//{%s}TrustedEntities' % NS['ti']):
+        for entities_el in profile_el.findall('.//{{{}}}TrustedEntities'.format(NS['ti'])):
             select = entities_el.text
             match = entities_el.attrib.get('match', 'registrationAuthority')
             include = entities_el.attrib.get('include', True)
@@ -1007,13 +1033,31 @@ def discojson_sp(e, global_trust_info=None, global_md_sources=None):
             sp['profiles'][name]['entities'].append({'select': select, 'match': match, 'include': include})
 
     if global_trust_info is not None and global_md_sources is not None:
-        for profileref_el in tinfo_el.findall('.//{%s}TrustProfileRef' % NS['ti']):
+        for profileref_el in tinfo_el.findall('.//{{{}}}TrustProfileRef'.format(NS['ti'])):
             refname = profileref_el.text
             sources = global_md_sources[sp['entityID']]
             for source in sources:
                 if refname in global_trust_info[source]:
                     sp['profiles'][refname] = global_trust_info[source][refname]
                     break
+
+    return sp
+
+
+def discojson_sp_attr(e):
+    attribute = "https://refeds.org/entity-selection-profile"
+    b64_trustinfos = entity_attribute(e, attribute)
+    if b64_trustinfos is None:
+        return None
+
+    sp = {}
+    sp['entityID'] = e.get('entityID', None)
+    sp['profiles'] = {}
+
+    for b64_trustinfo in b64_trustinfos:
+        str_trustinfo = b64decode(b64_trustinfo.encode('ascii'))
+        trustinfo = json.loads(str_trustinfo.decode('utf8'))
+        sp['profiles'].update(trustinfo['profiles'])
 
     return sp
 
@@ -1026,6 +1070,22 @@ def discojson_sp_t(req):
 
     for e in iter_entities(t):
         sp = discojson_sp(e, global_trust_info=global_tinfo, global_md_sources=global_sources)
+        if sp is not None:
+            d.append(sp)
+
+        sp = discojson_sp_attr(e)
+        if sp is not None:
+            d.append(sp)
+
+    return d
+
+
+def discojson_sp_attr_t(req):
+    d = []
+    t = req.t
+
+    for e in iter_entities(t):
+        sp = discojson_sp_attr(e)
         if sp is not None:
             d.append(sp)
 
@@ -1064,19 +1124,19 @@ def entity_simple_summary(e):
 
 
 def entity_orgurl(entity, langs=None):
-    for organizationUrl in filter_lang(entity.iter("{%s}OrganizationURL" % NS['md']), langs=langs):
+    for organizationUrl in filter_lang(entity.iter("{{{}}}OrganizationURL".format(NS['md'])), langs=langs):
         return organizationUrl.text
     return None
 
 
 def entity_service_name(entity, langs=None):
-    for serviceName in filter_lang(entity.iter("{%s}ServiceName" % NS['md']), langs=langs):
+    for serviceName in filter_lang(entity.iter("{{{}}}ServiceName".format(NS['md'])), langs=langs):
         return serviceName.text
     return None
 
 
 def entity_service_description(entity, langs=None):
-    for serviceName in filter_lang(entity.iter("{%s}ServiceDescription" % NS['md']), langs=langs):
+    for serviceName in filter_lang(entity.iter("{{{}}}ServiceDescription".format(NS['md'])), langs=langs):
         return serviceName.text
     return None
 
@@ -1084,19 +1144,19 @@ def entity_service_description(entity, langs=None):
 def entity_requested_attributes(entity, langs=None):
     return [
         (a.get('Name'), bool(a.get('isRequired')))
-        for a in filter_lang(entity.iter("{%s}RequestedAttribute" % NS['md']), langs=langs)
+        for a in filter_lang(entity.iter("{{{}}}RequestedAttribute".format(NS['md'])), langs=langs)
     ]
 
 
 def entity_idp(entity):
-    for idp in entity.iter("{%s}IDPSSODescriptor" % NS['md']):
+    for idp in entity.iter("{{{}}}IDPSSODescriptor".format(NS['md'])):
         return idp
 
     return None
 
 
 def entity_sp(entity):
-    for sp in entity.iter("{%s}SPSSODescriptor" % NS['md']):
+    for sp in entity.iter("{{{}}}SPSSODescriptor".format(NS['md'])):
         return sp
 
     return None
@@ -1104,16 +1164,16 @@ def entity_sp(entity):
 
 def entity_contacts(entity):
     def _contact_dict(contact):
-        first_name = first_text(contact, "{%s}GivenName" % NS['md'])
-        last_name = first_text(contact, "{%s}SurName" % NS['md'])
-        org = first_text(entity, "{%s}OrganizationName" % NS['md']) or first_text(
-            entity, "{%s}OrganizationDisplayName" % NS['md']
+        first_name = first_text(contact, "{{{}}}GivenName".format(NS['md']))
+        last_name = first_text(contact, "{{{}}}SurName".format(NS['md']))
+        org = first_text(entity, "{{{}}}OrganizationName".format(NS['md'])) or first_text(
+            entity, "{{{}}}OrganizationDisplayName".format(NS['md'])
         )
-        company = first_text(entity, "{%s}Company" % NS['md'])
-        mail = first_text(contact, "{%s}EmailAddress" % NS['md'])
+        company = first_text(entity, "{{{}}}Company".format(NS['md']))
+        mail = first_text(contact, "{{{}}}EmailAddress".format(NS['md']))
         display_name = "Unknown"
         if first_name and last_name:
-            display_name = ' '.join([first_name, last_name])
+            display_name = f'{first_name} {last_name}'
         elif first_name:
             display_name = first_name
         elif last_name:
@@ -1130,11 +1190,11 @@ def entity_contacts(entity):
             mail=mail,
         )
 
-    return [_contact_dict(c) for c in entity.iter("{%s}ContactPerson" % NS['md'])]
+    return [_contact_dict(c) for c in entity.iter("{{{}}}ContactPerson".format(NS['md']))]
 
 
 def entity_nameid_formats(entity):
-    return [nif.text for nif in entity.iter("{%s}NameIDFormat" % NS['md'])]
+    return [nif.text for nif in entity.iter("{{{}}}NameIDFormat".format(NS['md']))]
 
 
 def object_id(e):
@@ -1146,7 +1206,7 @@ def entity_simple_info(e, langs=None):
     d['service_name'] = entity_service_name(e, langs)
     d['service_descr'] = entity_service_description(e, langs)
     d['entity_attributes'] = entity_attribute_dict(e)
-    keywords = filter_lang(e.iter("{%s}Keywords" % NS['mdui']), langs=langs)
+    keywords = filter_lang(e.iter("{{{}}}Keywords".format(NS['mdui'])), langs=langs)
     if keywords is not None:
         lst = [elt.text for elt in keywords]
         if len(lst) > 0:
@@ -1156,7 +1216,7 @@ def entity_simple_info(e, langs=None):
 
 def entity_info(e, langs=None):
     d = entity_simple_summary(e)
-    keywords = filter_lang(e.iter("{%s}Keywords" % NS['mdui']), langs=langs)
+    keywords = filter_lang(e.iter("{{{}}}Keywords".format(NS['mdui'])), langs=langs)
     if keywords is not None:
         lst = [elt.text for elt in keywords]
         if len(lst) > 0:
@@ -1189,9 +1249,9 @@ def entity_extensions(e):
     :param e: an EntityDescriptor
     :return: a list
     """
-    ext = e.find("./{%s}Extensions" % NS['md'])
+    ext = e.find("./{{{}}}Extensions".format(NS['md']))
     if ext is None:
-        ext = etree.Element("{%s}Extensions" % NS['md'])
+        ext = etree.Element("{{{}}}Extensions".format(NS['md']))
         e.insert(0, ext)
     return ext
 
@@ -1206,11 +1266,11 @@ def annotate_entity(e, category, title, message, source=None):
     :param message: The ATOM content
     :param source: An optional source URL. It is added as a <link> element with @rel='saml-metadata-source'
     """
-    if e.tag != "{%s}EntityDescriptor" % NS['md'] and e.tag != "{%s}EntitiesDescriptor" % NS['md']:
+    if e.tag != "{{{}}}EntityDescriptor".format(NS['md']) and e.tag != "{{{}}}EntitiesDescriptor".format(NS['md']):
         raise MetadataException('I can only annotate EntityDescriptor or EntitiesDescriptor elements')
     subject = e.get('Name', e.get('entityID', None))
     atom = ElementMaker(nsmap={'atom': 'http://www.w3.org/2005/Atom'}, namespace='http://www.w3.org/2005/Atom')
-    args = [atom.published("%s" % datetime.now().isoformat()), atom.link(href=subject, rel="saml-metadata-subject")]
+    args = [atom.published(f"{datetime.now().isoformat()}"), atom.link(href=subject, rel="saml-metadata-subject")]
     if source is not None:
         args.append(atom.link(href=source, rel="saml-metadata-source"))
     args.extend([atom.title(title), atom.category(term=category), atom.content(message, type="text/plain")])
@@ -1219,18 +1279,20 @@ def annotate_entity(e, category, title, message, source=None):
 
 def _entity_attributes(e):
     ext = entity_extensions(e)
-    ea = ext.find(".//{%s}EntityAttributes" % NS['mdattr'])
+    ea = ext.find(".//{{{}}}EntityAttributes".format(NS['mdattr']))
     if ea is None:
-        ea = etree.Element("{%s}EntityAttributes" % NS['mdattr'])
+        ea = etree.Element("{{{}}}EntityAttributes".format(NS['mdattr']))
         ext.append(ea)
     return ea
 
 
 def _eattribute(e, attr, nf):
     ea = _entity_attributes(e)
-    a = ea.xpath(".//saml:Attribute[@NameFormat='%s' and @Name='%s']" % (nf, attr), namespaces=NS, smart_strings=False)
+    a = ea.xpath(
+        f".//saml:Attribute[@NameFormat='{nf}' and @Name='{attr}']", namespaces=NS, smart_strings=False
+    )
     if a is None or len(a) == 0:
-        a = etree.Element("{%s}Attribute" % NS['saml'])
+        a = etree.Element("{{{}}}Attribute".format(NS['saml']))
         a.set('NameFormat', nf)
         a.set('Name', attr)
         ea.append(a)
@@ -1247,18 +1309,18 @@ def set_entity_attributes(e, d, nf=NF_URI):
     :param nf: The nameFormat (by default "urn:oasis:names:tc:SAML:2.0:attrname-format:uri") to use.
     :raise: MetadataException unless e is an EntityDescriptor element
     """
-    if e.tag != "{%s}EntityDescriptor" % NS['md']:
+    if e.tag != "{{{}}}EntityDescriptor".format(NS['md']):
         raise MetadataException("I can only add EntityAttribute(s) to EntityDescriptor elements")
 
     for attr, value in d.items():
         a = _eattribute(e, attr, nf)
-        velt = etree.Element("{%s}AttributeValue" % NS['saml'])
+        velt = etree.Element("{{{}}}AttributeValue".format(NS['saml']))
         velt.text = value
         a.append(velt)
 
 
 def set_pubinfo(e, publisher=None, creation_instant=None):
-    if e.tag != "{%s}EntitiesDescriptor" % NS['md']:
+    if e.tag != "{{{}}}EntitiesDescriptor".format(NS['md']):
         raise MetadataException("I can only set RegistrationAuthority to EntitiesDescriptor elements")
     if publisher is None:
         raise MetadataException("At least publisher must be provided")
@@ -1267,10 +1329,10 @@ def set_pubinfo(e, publisher=None, creation_instant=None):
         creation_instant = datetime2iso(utc_now())
 
     ext = entity_extensions(e)
-    pi = ext.find(".//{%s}PublicationInfo" % NS['mdrpi'])
+    pi = ext.find(".//{{{}}}PublicationInfo".format(NS['mdrpi']))
     if pi is not None:
         raise MetadataException("A PublicationInfo element is already present")
-    pi = etree.Element("{%s}PublicationInfo" % NS['mdrpi'])
+    pi = etree.Element("{{{}}}PublicationInfo".format(NS['mdrpi']))
     pi.set('publisher', publisher)
     if creation_instant:
         pi.set('creationInstant', creation_instant)
@@ -1278,7 +1340,7 @@ def set_pubinfo(e, publisher=None, creation_instant=None):
 
 
 def set_reginfo(e, policy=None, authority=None):
-    if e.tag != "{%s}EntityDescriptor" % NS['md']:
+    if e.tag != "{{{}}}EntityDescriptor".format(NS['md']):
         raise MetadataException("I can only set RegistrationAuthority to EntityDescriptor elements")
     if authority is None:
         raise MetadataException("At least authority must be provided")
@@ -1286,23 +1348,23 @@ def set_reginfo(e, policy=None, authority=None):
         policy = dict()
 
     ext = entity_extensions(e)
-    ri = ext.find(".//{%s}RegistrationInfo" % NS['mdrpi'])
+    ri = ext.find(".//{{{}}}RegistrationInfo".format(NS['mdrpi']))
     if ri is not None:
         ext.remove(ri)
 
-    ri = etree.Element("{%s}RegistrationInfo" % NS['mdrpi'])
+    ri = etree.Element("{{{}}}RegistrationInfo".format(NS['mdrpi']))
     ext.append(ri)
     ri.set('registrationAuthority', authority)
     for lang, policy_url in policy.items():
-        rp = etree.Element("{%s}RegistrationPolicy" % NS['mdrpi'])
+        rp = etree.Element("{{{}}}RegistrationPolicy".format(NS['mdrpi']))
         rp.text = policy_url
-        rp.set('{%s}lang' % NS['xml'], lang)
+        rp.set('{{{}}}lang'.format(NS['xml']), lang)
         ri.append(rp)
 
 
 def expiration(t):
     relt = root(t)
-    if relt.tag in ('{%s}EntityDescriptor' % NS['md'], '{%s}EntitiesDescriptor' % NS['md']):
+    if relt.tag in ('{{{}}}EntityDescriptor'.format(NS['md']), '{{{}}}EntitiesDescriptor'.format(NS['md'])):
         cache_duration = config.default_cache_duration
         valid_until = relt.get('validUntil', None)
         if valid_until is not None:
@@ -1338,11 +1400,11 @@ def sort_entities(t, sxp=None):
                 except AttributeError:
                     pass
             except IndexError:
-                log.warning("Sort pipe: unable to sort entity by '%s'. " "Entity '%s' has no such value" % (sxp, eid))
+                log.warning(f"Sort pipe: unable to sort entity by '{sxp}'. Entity '{eid}' has no such value")
         except TypeError:
             pass
 
-        log.debug("Generated sort key for entityID='%s' and %s='%s'" % (eid, sxp, sv))
+        log.debug(f"Generated sort key for entityID='{eid}' and {sxp}='{sv}'")
         return sv is None, sv, eid
 
     container = root(t)
@@ -1356,29 +1418,29 @@ def set_nodecountry(e, country_code):
     :param country_code: An ISO country code
     :raise: MetadataException unless e is an EntityDescriptor element
     """
-    if e.tag != "{%s}EntityDescriptor" % NS['md']:
+    if e.tag != "{{{}}}EntityDescriptor".format(NS['md']):
         raise MetadataException("I can only add NodeCountry to EntityDescriptor elements")
 
     def _set_nodecountry_in_ext(ext_elt, iso_cc):
-        nc_elt = ext_elt.find("./{%s}NodeCountry" % NS['eidas'])
+        nc_elt = ext_elt.find("./{{{}}}NodeCountry".format(NS['eidas']))
         if ext_elt is not None and nc_elt is None:
-            velt = etree.Element("{%s}NodeCountry" % NS['eidas'])
+            velt = etree.Element("{{{}}}NodeCountry".format(NS['eidas']))
             velt.text = iso_cc
             ext_elt.append(velt)
 
     ext = None
-    idp = e.find("./{%s}IDPSSODescriptor" % NS['md'])
+    idp = e.find("./{{{}}}IDPSSODescriptor".format(NS['md']))
     if idp is not None and len(idp) > 0:
         ext = entity_extensions(idp)
         _set_nodecountry_in_ext(ext, country_code)
 
-    sp = e.find("./{%s}SPSSODescriptor" % NS['md'])
+    sp = e.find("./{{{}}}SPSSODescriptor".format(NS['md']))
     if sp is not None and len(sp) > 0:
         ext = entity_extensions(sp)
         _set_nodecountry_in_ext(ext, country_code)
 
 
 def diff(t1, t2):
-    s1 = set([e.get('entityID') for e in iter_entities(root(t1))])
-    s2 = set([e.get('entityID') for e in iter_entities(root(t2))])
+    s1 = {e.get('entityID') for e in iter_entities(root(t1))}
+    s2 = {e.get('entityID') for e in iter_entities(root(t2))}
     return s1.difference(s2)

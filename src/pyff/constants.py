@@ -8,10 +8,9 @@ import logging
 import os
 import re
 import sys
-from str2bool import str2bool
 
 import pyconfig
-import six
+from str2bool import str2bool
 
 from pyff import __version__ as pyff_version
 
@@ -37,6 +36,7 @@ NS = dict(
     ser="http://eidas.europa.eu/metadata/servicelist",
     eidas="http://eidas.europa.eu/saml-extensions",
     ti="https://seamlessaccess.org/NS/trustinfo",
+    idpdisc="urn:oasis:names:tc:SAML:profiles:SSO:idp-discovery-protocol",
 )
 
 #: These are the attribute aliases pyFF knows about. These are used to build URI paths, populate the index
@@ -57,7 +57,7 @@ DIGESTS = ['sha1', 'md5', 'null']
 
 
 def as_string(o):
-    if type(o) not in six.string_types:
+    if type(o) not in (str,):
         o = str(o)
     return o
 
@@ -67,21 +67,21 @@ def as_int(o):
 
 
 def as_loglevel(o):
-    if type(o) in six.string_types:
+    if type(o) in (str,):
         if hasattr(logging, str(o)):
             o = getattr(logging, str(o))
-        raise ValueError("No such loglevel: {}".format(repr(o)))
+        raise ValueError(f"No such loglevel: {repr(o)}")
     return o
 
 
 def as_list_of_string(o):
-    if type(o) in six.string_types:
+    if type(o) in (str,):
         o = re.findall(r'[^,:\s]+', o)
     return o
 
 
 def as_dict_of_string(o):
-    if type(o) in six.string_types:
+    if type(o) in (str,):
         o = json.loads(o)
     return o
 
@@ -92,7 +92,7 @@ def as_bool(o):
     return o
 
 
-class BaseSetting(object):
+class BaseSetting:
     def __init__(
         self,
         name,
@@ -115,12 +115,12 @@ class BaseSetting(object):
         self.value = None
         self.long = long
         self.hidden = hidden
-        self.fallback = pyconfig.setting('pyff.{}'.format(self.name), default, allow_default=True)
+        self.fallback = pyconfig.setting(f'pyff.{self.name}', default, allow_default=True)
 
     @property
     def default_fmt(self):
         if self.default:
-            return "[{}]".format(str(self.default))
+            return f"[{str(self.default)}]"
         else:
             return ''
 
@@ -161,16 +161,16 @@ class BaseSetting(object):
             if (hasattr(self, 'typeconv') and self.typeconv == as_bool) or isinstance(self, InvertedSetting):
                 return self.short
             else:
-                return '{}:'.format(self.short)
+                return f'{self.short}:'
         else:
             return ''
 
     def long_spec(self):
         long_name = self.long_name
         if hasattr(self, 'typeconv') and self.typeconv == as_bool:
-            return '{}'.format(long_name)
+            return f'{long_name}'
         else:
-            return '{}='.format(long_name)
+            return f'{long_name}='
 
 
 class EnvSetting(BaseSetting):
@@ -225,7 +225,7 @@ def N(*args: object, **kwargs: object) -> BaseSetting:
     return InvertedSetting(*args, **kwargs)
 
 
-class Config(object):
+class Config:
     """
     The :py:const:`pyff.constants:config` object is a singleton instance of this Class and contains all
     configuration parameters available to pyFF. Each parameter can be set directly, via :py:mod:`pyconfig`
@@ -263,7 +263,7 @@ class Config(object):
     allow_shutdown = S("allow_shutdown", default=False, typeconv=as_bool, deprecated=True)
     ds_template = S("ds_template", default="ds.html", deprecated=True)
 
-    loglevel = S("loglevel", default=logging.WARN, info="set the loglevel")
+    loglevel = S("loglevel", default='WARN', info="set the loglevel")
 
     access_log = S("access_log", cmdline=['pyffd'], info="a log target (file) to use for access logs")
 
@@ -289,7 +289,7 @@ class Config(object):
 
     caching_enabled = S("caching_enabled", default=True, typeconv=as_bool, info="enable caching?")
 
-    no_cashing = N('no_cashing', invert=caching_enabled, short='C', info="disable all caches")
+    no_caching = N('no_caching', invert=caching_enabled, short='C', info="disable all caches")
 
     daemonize = S("daemonize", default=True, cmdline=['pyffd'], info="run in background")
 
@@ -466,7 +466,7 @@ class Config(object):
     def base_url(self):
         if self.public_url:
             return self.public_url
-        return "http://{}{}".format(config.host, "" if config.port == 80 else ":{}".format(config.port))
+        return "http://{}{}".format(config.host, "" if config.port == 80 else f":{config.port}")
 
     @staticmethod
     def settings():
@@ -477,12 +477,12 @@ class Config(object):
     def __str__(self):
         s = "# pyFF configuration\n"
         for p in self.settings():
-            s += "{} = {}\n".format(p.name, p.value)
+            s += f"{p.name} = {p.value}\n"
         return s
 
     def find_setting(self, o):
         for s in self.settings():
-            if o == s.short_name or o == s.long_name:
+            if o in (s.short_name, s.long_name):
                 return s
         return None
 
@@ -501,10 +501,10 @@ class Config(object):
         hlp = "Usage: {} [options+] <pipeline file (yaml)>\n\n"
         for s in config.settings():
             if prg in s.cmdline and not s.deprecated and not s.hidden:
-                h = " --{}".format(s.long_name)
+                h = f" --{s.long_name}"
                 if s.short:
-                    h += "|-{}".format(s.short)
-                hlp += "{:30s} {} {}\n".format(h, s.info, s.default_fmt)
+                    h += f"|-{s.short}"
+                hlp += f"{h:30s} {s.info} {s.default_fmt}\n"
         return hlp
 
 
@@ -522,10 +522,10 @@ def parse_options(program, docs):
         sys.exit(2)
 
     if config.loglevel is None:
-        config.loglevel = logging.INFO
-
-    if config.aliases is None or len(config.aliases) == 0:
-        config.aliases = dict(metadata=entities)
+        config.loglevel = 'INFO'
+    # FIXME, don't know what this is, but it is wrong.
+    #    if config.aliases is None or len(config.aliases) == 0:
+    #        config.aliases = dict(metadata=entities)
 
     if config.modules is None:
         config.modules = []
@@ -535,8 +535,8 @@ def parse_options(program, docs):
             if o in ('-h', '--help'):
                 print(docs)
                 sys.exit(0)
-            elif o in ('--version',):
-                print("{} version {}".format(program, pyff_version))
+            elif o in ('-v', '--version'):
+                print(f"{program} version {pyff_version}")
                 sys.exit(0)
             elif o in ('-A', '--alias'):
                 (a, colon, uri) = a.partition(':')
@@ -550,11 +550,11 @@ def parse_options(program, docs):
                 s = config.find_setting(o)
                 if s is not None:
                     if s.deprecated:
-                        print("WARNING: {} is deprecated. Setting this option has no effect!".format(o))
+                        print(f"WARNING: {o} is deprecated. Setting this option has no effect!")
                     else:
                         setattr(s, 'value', a)
                 else:
-                    raise ValueError("Unknown option {}".format(o))
+                    raise ValueError(f"Unknown option {o}")
 
         if config.compat_dir and not config.base_dir:
             config.base_dir = config.compat_dir

@@ -1,11 +1,9 @@
-# coding=utf-8
-
-
 """
 
 This module contains various utilities.
 
 """
+
 import base64
 import cgi
 import contextlib
@@ -19,13 +17,15 @@ import threading
 import time
 import traceback
 from _collections_abc import Mapping, MutableMapping
+from collections.abc import Sequence
 from copy import copy
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate
 from itertools import chain
 from threading import local
 from time import gmtime, strftime
-from typing import Any, BinaryIO, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, BinaryIO, Callable, Optional, Union
+from urllib.parse import urlparse
 
 import pkg_resources
 import requests
@@ -43,11 +43,10 @@ from requests.packages.urllib3.util.retry import Retry
 from requests.structures import CaseInsensitiveDict
 from requests_cache import CachedSession
 from requests_file import FileAdapter
-from six.moves.urllib_parse import urlparse
 
 from pyff import __version__
 from pyff.constants import NS, config
-from pyff.exceptions import *
+from pyff.exceptions import MetadataException, ResourceException
 from pyff.logs import get_log
 
 etree.set_default_parser(etree.XMLParser(resolve_entities=False))
@@ -68,15 +67,15 @@ def xml_error(error_log, m=None):
             return False
         return True
 
-    return "\n".join(filter(_f, ["%s" % e for e in error_log]))
+    return "\n".join(filter(_f, [f"{e}" for e in error_log]))
 
 
 def debug_observer(e):
     log.error(repr(e))
 
 
-def trunc_str(x, l):
-    return (x[:l] + '..') if len(x) > l else x
+def trunc_str(x, length):
+    return (x[:length] + '..') if len(x) > length else x
 
 
 def resource_string(name: str, pfx: Optional[str] = None) -> Optional[Union[str, bytes]]:
@@ -99,15 +98,15 @@ def resource_string(name: str, pfx: Optional[str] = None) -> Optional[Union[str,
     name = os.path.expanduser(name)
     data: Optional[Union[str, bytes]] = None
     if os.path.exists(name):
-        with io.open(name) as fd:
+        with open(name) as fd:
             data = fd.read()
     elif pfx and os.path.exists(os.path.join(pfx, name)):
-        with io.open(os.path.join(pfx, name)) as fd:
+        with open(os.path.join(pfx, name)) as fd:
             data = fd.read()
     elif pkg_resources.resource_exists(__name__, name):
         data = pkg_resources.resource_string(__name__, name)
-    elif pfx and pkg_resources.resource_exists(__name__, "%s/%s" % (pfx, name)):
-        data = pkg_resources.resource_string(__name__, "%s/%s" % (pfx, name))
+    elif pfx and pkg_resources.resource_exists(__name__, f"{pfx}/{name}"):
+        data = pkg_resources.resource_string(__name__, f"{pfx}/{name}")
 
     return data
 
@@ -135,8 +134,8 @@ def resource_filename(name, pfx=None):
         return os.path.join(pfx, name)
     elif pkg_resources.resource_exists(__name__, name):
         return pkg_resources.resource_filename(__name__, name)
-    elif pfx and pkg_resources.resource_exists(__name__, "%s/%s" % (pfx, name)):
-        return pkg_resources.resource_filename(__name__, "%s/%s" % (pfx, name))
+    elif pfx and pkg_resources.resource_exists(__name__, f"{pfx}/{name}"):
+        return pkg_resources.resource_filename(__name__, f"{pfx}/{name}")
 
     return None
 
@@ -145,7 +144,7 @@ def totimestamp(dt: datetime, epoch=datetime(1970, 1, 1)) -> int:
     epoch = epoch.replace(tzinfo=dt.tzinfo)
 
     td = dt - epoch
-    ts = (td.microseconds + (td.seconds + td.days * 24 * 3600) * 10 ** 6) / 1e6
+    ts = (td.microseconds + (td.seconds + td.days * 24 * 3600) * 10**6) / 1e6
     return int(ts)
 
 
@@ -201,7 +200,7 @@ def first_text(elt, tag, default=None):
 
 class ResourceResolver(etree.Resolver):
     def __init__(self):
-        super(ResourceResolver, self).__init__()
+        super().__init__()
 
     def resolve(self, system_url, public_id, context):
         """
@@ -212,10 +211,10 @@ class ResourceResolver(etree.Resolver):
         fn = path[len(path) - 1]
         if pkg_resources.resource_exists(__name__, fn):
             return self.resolve_file(pkg_resources.resource_stream(__name__, fn), context)
-        elif pkg_resources.resource_exists(__name__, "schema/%s" % fn):
-            return self.resolve_file(pkg_resources.resource_stream(__name__, "schema/%s" % fn), context)
+        elif pkg_resources.resource_exists(__name__, f"schema/{fn}"):
+            return self.resolve_file(pkg_resources.resource_stream(__name__, f"schema/{fn}"), context)
         else:
-            raise ValueError("Unable to locate %s" % fn)
+            raise ValueError(f"Unable to locate {fn}")
 
 
 thread_local_lock = threading.Lock()
@@ -266,7 +265,7 @@ def redis():
 
 def check_signature(t: ElementTree, key: Optional[str], only_one_signature: bool = False) -> ElementTree:
     if key is not None:
-        log.debug("verifying signature using %s" % key)
+        log.debug(f"verifying signature using {key}")
         refs = xmlsec.verified(t, key, drop_signature=True)
         if only_one_signature and len(refs) != 1:
             raise MetadataException("XML metadata contains %d signatures - exactly 1 is required" % len(refs))
@@ -304,24 +303,18 @@ def safe_write(fn, data, mkdirs=False):
     try:
         fn = os.path.expanduser(fn)
         dirname, basename = os.path.split(fn)
-        kwargs = dict(delete=False, prefix=".%s" % basename, dir=dirname)
-        if six.PY3:
-            kwargs['encoding'] = "utf-8"
-            mode = 'w+'
-        else:
-            mode = 'w+b'
+        kwargs = dict(delete=False, prefix=f".{basename}", dir=dirname)
+        kwargs['encoding'] = "utf-8"
+        mode = 'w+'
 
         if mkdirs:
             ensure_dir(fn)
 
-        if isinstance(data, six.binary_type):
+        if isinstance(data, bytes):
             data = data.decode('utf-8')
 
         with tempfile.NamedTemporaryFile(mode, **kwargs) as tmp:
-            if six.PY2:
-                data = data.encode('utf-8')
-
-            log.debug("safe writing {} chrs into {}".format(len(data), fn))
+            log.debug(f"safe writing {len(data)} chrs into {fn}")
             tmp.write(data)
             tmpn = tmp.name
         if os.path.exists(tmpn) and os.stat(tmpn).st_size > 0:
@@ -356,7 +349,7 @@ def root(t):
 
 def with_tree(elt, cb):
     cb(elt)
-    if isinstance(elt.tag, six.string_types):
+    if isinstance(elt.tag, str):
         for child in list(elt):
             with_tree(child, cb)
 
@@ -394,7 +387,7 @@ def _lang(elt: Element, default_lang: Optional[str]) -> Optional[str]:
     return elt.get("{http://www.w3.org/XML/1998/namespace}lang", default_lang)
 
 
-def lang_dict(elts: Sequence[Element], getter=lambda e: e, default_lang: Optional[str] = None) -> Dict[str, Callable]:
+def lang_dict(elts: Sequence[Element], getter=lambda e: e, default_lang: Optional[str] = None) -> dict[str, Callable]:
     if default_lang is None:
         default_lang = config.langs[0]
 
@@ -411,7 +404,7 @@ def find_lang(elts: Sequence[Element], lang: str, default_lang: str) -> Element:
     return next((e for e in elts if _lang(e, default_lang) == lang), elts[0])
 
 
-def filter_lang(elts: Any, langs: Optional[Sequence[str]] = None) -> List[Element]:
+def filter_lang(elts: Any, langs: Optional[Sequence[str]] = None) -> list[Element]:
     if langs is None or type(langs) is not list:
         langs = config.langs
 
@@ -429,7 +422,7 @@ def filter_lang(elts: Any, langs: Optional[Sequence[str]] = None) -> List[Elemen
         raise RuntimeError('Configuration is missing langs')
 
     dflt = langs[0]
-    lst = [find_lang(elts, l, dflt) for l in langs]
+    lst = [find_lang(elts, lang, dflt) for lang in langs]
     if len(lst) > 0:
         return lst
     else:
@@ -452,11 +445,11 @@ def xslt_transform(t, stylesheet, params=None):
         return transform(t, **params)
     except etree.XSLTApplyError as ex:
         for entry in transform.error_log:
-            log.error('\tmessage from line %s, col %s: %s' % (entry.line, entry.column, entry.message))
+            log.error(f'\tmessage from line {entry.line}, col {entry.column}: {entry.message}')
             log.error('\tdomain: %s (%d)' % (entry.domain_name, entry.domain))
             log.error('\ttype: %s (%d)' % (entry.type_name, entry.type))
             log.error('\tlevel: %s (%d)' % (entry.level_name, entry.level))
-            log.error('\tfilename: %s' % entry.filename)
+            log.error(f'\tfilename: {entry.filename}')
         raise ex
 
 
@@ -485,7 +478,7 @@ def total_seconds(dt: timedelta) -> float:
     if hasattr(dt, "total_seconds"):
         return dt.total_seconds()
     # TODO: Remove? I guess this is for Python < 3
-    return (dt.microseconds + (dt.seconds + dt.days * 24 * 3600) * 10 ** 6) / 10 ** 6
+    return (dt.microseconds + (dt.seconds + dt.days * 24 * 3600) * 10**6) / 10**6
 
 
 def etag(s):
@@ -499,7 +492,7 @@ def hash_id(entity: Element, hn: str = 'sha1', prefix: bool = True) -> str:
 
     hstr = hex_digest(entity_id, hn)
     if prefix:
-        return "{%s}%s" % (hn, hstr)
+        return f"{{{hn}}}{hstr}"
     else:
         return hstr
 
@@ -509,9 +502,9 @@ def hex_digest(data, hn='sha1'):
         return data
 
     if not hasattr(hashlib, hn):
-        raise ValueError("Unknown digest '%s'" % hn)
+        raise ValueError(f"Unknown digest '{hn}'")
 
-    if not isinstance(data, six.binary_type):
+    if not isinstance(data, bytes):
         data = data.encode("utf-8")
 
     m = getattr(hashlib, hn)()
@@ -532,7 +525,7 @@ def has_tag(t, tag):
 
 
 def url2host(url):
-    (host, sep, port) = urlparse(url).netloc.partition(':')
+    (host, sep, _port) = urlparse(url).netloc.partition(':')
     return host
 
 
@@ -601,7 +594,7 @@ def load_callable(name):
 # many thanks to Anders Lordahl & Scotty Logan for the idea
 def guess_entity_software(e):
     for elt in chain(
-        e.findall(".//{%s}SingleSignOnService" % NS['md']), e.findall(".//{%s}AssertionConsumerService" % NS['md'])
+        e.findall(".//{{{}}}SingleSignOnService".format(NS['md'])), e.findall(".//{{{}}}AssertionConsumerService".format(NS['md']))
     ):
         location = elt.get('Location')
         if location:
@@ -616,7 +609,7 @@ def guess_entity_software(e):
                 return 'SimpleSAMLphp'
             if location.endswith('user/authenticate'):
                 return 'KalturaSSP'
-            if location.endswith('adfs/ls') or location.endswith('adfs/ls/'):
+            if location.endswith(('adfs/ls', 'adfs/ls/')):
                 return 'ADFS'
             if '/oala/' in location or 'login.openathens.net' in location:
                 return 'OpenAthens'
@@ -664,13 +657,13 @@ def guess_entity_software(e):
 
 
 def is_text(x: Any) -> bool:
-    return isinstance(x, six.string_types) or isinstance(x, six.text_type)
+    return isinstance(x, str) or isinstance(x, str)
 
 
-def chunks(l, n):
+def chunks(input_list, n):
     """Yield successive n-sized chunks from l."""
-    for i in range(0, len(l), n):
-        yield l[i : i + n]
+    for i in range(0, len(input_list), n):
+        yield input_list[i : i + n]
 
 
 class DirAdapter(BaseAdapter):
@@ -683,8 +676,8 @@ class DirAdapter(BaseAdapter):
         resp = Response()
         (_, _, _dir) = request.url.partition('://')
         if _dir is None or len(_dir) == 0:
-            raise ValueError("not a directory url: {}".format(request.url))
-        resp.raw = six.BytesIO(six.b(_dir))
+            raise ValueError(f"not a directory url: {request.url}")
+        resp.raw = io.BytesIO(_dir.encode("latin-1"))
         resp.status_code = 200
         resp.reason = "OK"
         resp.headers = {}
@@ -722,20 +715,17 @@ def url_get(url: str, verify_tls: Optional[bool] = False) -> Response:
         s.mount('http://', adapter)
         s.mount('https://', adapter)
 
-    headers = {'User-Agent': "pyFF/{}".format(__version__), 'Accept': '*/*'}
+    headers = {'User-Agent': f"pyFF/{__version__}", 'Accept': '*/*'}
     _etag = None
     if _etag is not None:
         headers['If-None-Match'] = _etag
     try:
         r = s.get(url, headers=headers, verify=verify_tls, timeout=config.request_timeout)
-    except IOError as ex:
+    except OSError:
         s = requests.Session()
         r = s.get(url, headers=headers, verify=verify_tls, timeout=config.request_timeout)
 
-    if six.PY2:
-        r.encoding = "utf-8"
-
-    log.debug("url_get({}) returns {} chrs encoded as {}".format(url, len(r.content), r.encoding))
+    log.debug(f"url_get({url}) returns {len(r.content)} chrs encoded as {r.encoding}")
 
     if config.request_override_encoding is not None:
         r.encoding = config.request_override_encoding
@@ -759,7 +749,7 @@ def safe_b64d(s: str) -> bytes:
 
 def img_to_data(data: bytes, content_type: str) -> Optional[str]:
     """Convert a file (specified by a path) into a data URI."""
-    mime_type, options = cgi.parse_header(content_type)
+    mime_type, _options = cgi.parse_header(content_type)
     data64 = None
     if len(data) > config.icon_maxsize:
         return None
@@ -784,7 +774,7 @@ def img_to_data(data: bytes, content_type: str) -> Optional[str]:
 
     if data64 is None or len(data64) == 0:
         data64 = safe_b64e(data)
-    return 'data:{};base64,{}'.format(mime_type, data64)
+    return f'data:{mime_type};base64,{data64}'
 
 
 def short_id(data):
@@ -793,18 +783,18 @@ def short_id(data):
 
 
 def unicode_stream(data: str) -> io.BytesIO:
-    return six.BytesIO(data.encode('UTF-8'))
+    return io.BytesIO(data.encode('UTF-8'))
 
 
-def b2u(data: Union[str, bytes, Tuple, List, Set]) -> Union[str, bytes, Tuple, List, Set]:
+def b2u(data: Union[str, bytes, tuple, list, set]) -> Union[str, bytes, tuple, list, set]:
     if is_text(data):
         return data
-    elif isinstance(data, six.binary_type):
+    elif isinstance(data, bytes):
         return data.decode("utf-8")
     elif isinstance(data, tuple) or isinstance(data, list):
         return [b2u(item) for item in data]
     elif isinstance(data, set):
-        return set([b2u(item) for item in data])
+        return {b2u(item) for item in data}
     return data
 
 
@@ -820,10 +810,10 @@ def json_serializer(o):
     if isinstance(o, threading.Thread):
         return o.name
 
-    raise ValueError("Object {} of type {} is not JSON-serializable via this function".format(repr(o), type(o)))
+    raise ValueError(f"Object {repr(o)} of type {type(o)} is not JSON-serializable via this function")
 
 
-class Lambda(object):
+class Lambda:
     def __init__(self, cb: Callable, *args, **kwargs):
         self._cb = cb
         self._args = [a for a in args]
@@ -852,7 +842,7 @@ def make_default_scheduler():
     elif config.scheduler_job_store == 'memory':
         jobstore = MemoryJobStore()
     else:
-        raise ValueError("unknown or unsupported job store type '{}'".format(config.scheduler_job_store))
+        raise ValueError(f"unknown or unsupported job store type '{config.scheduler_job_store}'")
     return BackgroundScheduler(
         executors={'default': ThreadPoolExecutor(config.worker_pool_size)},
         jobstores={'default': jobstore},
@@ -879,8 +869,7 @@ class MappingStack(Mapping):
 
     def __iter__(self):
         for d in self._m:
-            for item in d:
-                yield item
+            yield from d
 
     def __len__(self) -> int:
         return sum([len(d) for d in self._m])
@@ -941,8 +930,8 @@ def is_past_ttl(last_seen, ttl=config.cache_ttl):
     return now > int(last_seen) + fuzz
 
 
-class Watchable(object):
-    class Watcher(object):
+class Watchable:
+    class Watcher:
         def __init__(self, cb, args, kwargs):
             self.cb = cb
             self.args = args
@@ -964,7 +953,7 @@ class Watchable(object):
     def add_watcher(self, cb, *args, **kwargs):
         self.watchers.append(Watchable.Watcher(cb, args, kwargs))
 
-    def remove_watcher(self, cb, *args, **kwargs):
+    def remove_watcher(self, cb, *_args, **_kwargs):
         self.watchers.remove(Watchable.Watcher(cb))
 
     def notify(self, *args, **kwargs):
@@ -978,5 +967,5 @@ class Watchable(object):
 
 
 def utc_now() -> datetime:
-    """ Return current time with tz=UTC """
+    """Return current time with tz=UTC"""
     return datetime.now(tz=timezone.utc)

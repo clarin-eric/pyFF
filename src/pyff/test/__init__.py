@@ -1,3 +1,4 @@
+import importlib.resources
 import logging
 import os
 import socket
@@ -5,9 +6,6 @@ import subprocess
 import sys
 import tempfile
 from unittest import TestCase
-
-import pkg_resources
-import six
 
 from pyff import __version__ as pyffversion
 
@@ -31,7 +29,7 @@ def find_unbound_port(i=0):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.bind(("127.0.0.1", port))
-        except socket.error:
+        except OSError:
             pass
         return port
 
@@ -47,10 +45,10 @@ def run_pyffd(*args):
 def run_cmdline(script, *args):
     argv = list(*args)
     starter = tempfile.NamedTemporaryFile('w').name
-    print("starting %s using %s" % (script, starter))
+    print(f"starting {script} using {starter}")
     with open(starter, 'w') as fd:
         fd.write(
-            """#!%s
+            f"""#!{sys.executable}
 import sys
 import coverage
 import os
@@ -60,17 +58,16 @@ if __name__ == '__main__':
     cov.start()
     rv = 0
     try:
-        rv = load_entry_point('pyFF==%s', 'console_scripts', '%s')()
+        rv = load_entry_point('pyFF=={pyffversion}', 'console_scripts', '{script}')()
     except Exception as ex:
         raise ex
     finally:
         cov.stop()
         cov.save()
-        os.rename('.coverage','.coverage.%%d' %% os.getpid())
+        os.rename('.coverage','.coverage.%d' % os.getpid())
     sys.exit(rv)
 
 """
-            % (sys.executable, pyffversion, script)
         )
     os.chmod(starter, 0o700)
 
@@ -79,9 +76,9 @@ if __name__ == '__main__':
     out, err = proc.communicate()
     rv = proc.wait()
     os.unlink(starter)
-    if isinstance(out, six.binary_type):
+    if isinstance(out, bytes):
         out = out.decode('utf-8')
-    if isinstance(err, six.binary_type):
+    if isinstance(err, bytes):
         err = err.decode('utf-8')
 
     print(">> STDOUT ---")
@@ -109,16 +106,14 @@ def _p(args, outf=None, ignore_exit=False):
     if outf is not None:
         with open(outf, "w") as fd:
             fd.write(out.decode('UTF-8'))
-    else:
-        if out is not None and len(out) > 0:
-            logging.debug(out.decode('UTF-8'))
+    elif out is not None and len(out) > 0:
+        logging.debug(out.decode('UTF-8'))
     rv = proc.wait()
     if rv and not ignore_exit:
         raise RuntimeError("command exited with code != 0: %d" % rv)
 
 
 class SignerTestCase(TestCase):
-
     datadir = None
     private_keyspec = None
     public_keyspec = None
@@ -128,7 +123,10 @@ class SignerTestCase(TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.datadir = pkg_resources.resource_filename(__name__, 'data')
+        cls.datadir = importlib.resources.files(
+            __name__,
+        ).joinpath('data')
+
         cls.private_keyspec = tempfile.NamedTemporaryFile('w').name
         cls.public_keyspec = tempfile.NamedTemporaryFile('w').name
 

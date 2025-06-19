@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import operator
 import os
@@ -8,8 +9,6 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from threading import ThreadError
 
-import ipaddress
-import six
 from cachetools.func import ttl_cache
 from redis_collections import Dict, Set
 from whoosh.fields import ID, KEYWORD, NGRAMWORDS, Schema
@@ -66,7 +65,7 @@ def make_icon_store_instance(*args, **kwargs):
     return new_store(*args, **kwargs)
 
 
-class Unpickled(object):
+class Unpickled:
     def _pickle(self, data):
         return data
 
@@ -128,7 +127,7 @@ class XMLDict(Dict):
     _unpickle_value = _unpickle
 
 
-class IconStore(object):
+class IconStore:
     def __init__(self):
         pass
 
@@ -150,11 +149,11 @@ class IconStore(object):
     def __call__(self, *args, **kwargs):
         watched = kwargs.pop('watched', None)
         scheduler = kwargs.pop('scheduler', None)
-        log.debug("about to schedule icon refresh on {} using {}".format(self, scheduler.state))
+        log.debug(f"about to schedule icon refresh on {self} using {scheduler.state}")
         if watched is not None and scheduler is not None:
             urls = []
             for r in watched.walk():
-                log.debug("looking at {}".format(r.url))
+                log.debug(f"looking at {r.url}")
                 if r.t is not None:
                     for e in iter_entities(r.t):
                         ico = entity_icon_url(e)
@@ -182,7 +181,7 @@ class IconStore(object):
             if not self.is_valid(u):
                 tbs.append(u)
 
-        log.debug("fetching {} icons".format(len(tbs)))
+        log.debug(f"fetching {len(tbs)} icons")
         if len(tbs) > 0:
             icon_handler = IconHandler(icon_store=self, name="Icons")
             icon_handler.schedule(tbs)
@@ -227,7 +226,7 @@ class RedisIconStore(IconStore):
         if not self._redis:
             self._redis = redis()  # XXX test cases won't get correctly unpicked because of this
         self.icons = LRUProxyDict(
-            JSONDict(key="{}_icons".format(self._name), redis=self._redis, writeback=True), maxsize=config.cache_size
+            JSONDict(key=f"{self._name}_icons", redis=self._redis, writeback=True), maxsize=config.cache_size
         )
 
     def lookup(self, uri):
@@ -254,19 +253,19 @@ class RedisIconStore(IconStore):
         self._setup()
 
     def reset(self):
-        self._redis.delete("{}_icons".format(self._name))
+        self._redis.delete(f"{self._name}_icons")
 
     def size(self):
         return len(self.icons)
 
 
-class SAMLStoreBase(object):
+class SAMLStoreBase:
     def lookup(self, key):
         raise NotImplementedError()
 
     def __iter__(self):
         for e in self.lookup("entities"):
-            log.debug("**** yield entityID=%s" % e.get('entityID'))
+            log.debug("**** yield entityID={}".format(e.get('entityID')))
             yield e
 
     def size(self, a=None, v=None):
@@ -282,7 +281,7 @@ class SAMLStoreBase(object):
         raise NotImplementedError()
 
     def entity_ids(self):
-        return set(e.get('entityID') for e in self.lookup('entities'))
+        return {e.get('entityID') for e in self.lookup('entities')}
 
     def _select(self, member=None):
         if member is None:
@@ -295,7 +294,7 @@ class SAMLStoreBase(object):
                     src = None
                 return self.select(src, xp=xp)
 
-        log.debug("calling store lookup %s" % member)
+        log.debug(f"calling store lookup {member}")
         return self.lookup(member)
 
     def __call__(self, *args, **kwargs):
@@ -304,7 +303,12 @@ class SAMLStoreBase(object):
         if watched is not None and scheduler is not None:
             for r in watched.walk():
                 if r.t is None and len(r.children) > 0:
-                    r.t = entitiesdescriptor(list(filter(lambda c: c is not None, [c.t for c in r.children])), name=r.name, validate=True, filter_invalid=True)
+                    r.t = entitiesdescriptor(
+                        list(filter(lambda c: c is not None, [c.t for c in r.children])),
+                        name=r.name,
+                        validate=True,
+                        filter_invalid=True,
+                    )
                 if r.t is not None:
                     self.update(r.t, tid=r.name, etag=r.etag)
                 else:
@@ -338,22 +342,22 @@ class SAMLStoreBase(object):
         the metadata repository then it is fetched an treated as a list of (one per line) of selectors. If all else
         fails an empty list is returned.
         """
-        l = self._select(member)
-        if hasattr(l, 'tag'):
-            l = [l]
-        elif hasattr(l, '__iter__'):
-            l = list(l)
+        res = self._select(member)
+        if hasattr(res, 'tag'):
+            res = [res]
+        elif hasattr(res, '__iter__'):
+            res = list(res)
 
         if xp is None:
-            return l
+            return res
         else:
-            log.debug("filtering %d entities using xpath %s" % (len(l), xp))
-            t = entitiesdescriptor(l, 'dummy', lookup_fn=self.lookup)
+            log.debug("filtering %d entities using xpath %s" % (len(res), xp))
+            t = entitiesdescriptor(res, 'dummy', lookup_fn=self.lookup)
             if t is None:
                 return []
-            l = root(t).xpath(xp, namespaces=NS, smart_strings=False)
-            log.debug("got %d entities after filtering" % len(l))
-            return l
+            res = root(t).xpath(xp, namespaces=NS, smart_strings=False)
+            log.debug("got %d entities after filtering" % len(res))
+            return res
 
     def merge(self, t, nt, strategy=merge_strategies.replace_existing, strategy_name=None):
         """
@@ -407,25 +411,25 @@ class SAMLStoreBase(object):
 
         match_query = bool(len(query) > 0)
 
-        if isinstance(query, six.string_types):
+        if isinstance(query, str):
             query = [query.lower()]
 
         def _strings(elt):
             lst = []
             for attr in [
-                '{%s}DisplayName' % NS['mdui'],
-                '{%s}ServiceName' % NS['md'],
-                '{%s}OrganizationDisplayName' % NS['md'],
-                '{%s}OrganizationName' % NS['md'],
-                '{%s}Keywords' % NS['mdui'],
-                '{%s}Scope' % NS['shibmd'],
+                '{{{}}}DisplayName'.format(NS['mdui']),
+                '{{{}}}ServiceName'.format(NS['md']),
+                '{{{}}}OrganizationDisplayName'.format(NS['md']),
+                '{{{}}}OrganizationName'.format(NS['md']),
+                '{{{}}}Keywords'.format(NS['mdui']),
+                '{{{}}}Scope'.format(NS['shibmd']),
             ]:
                 lst.extend([s.text for s in elt.iter(attr)])
             lst.append(elt.get('entityID'))
             return [item for item in lst if item is not None]
 
         def _ip_networks(elt):
-            return [ipaddress.ip_network(x.text) for x in elt.iter('{%s}IPHint' % NS['mdui'])]
+            return [ipaddress.ip_network(x.text) for x in elt.iter('{{{}}}IPHint'.format(NS['mdui']))]
 
         def _match(qq, elt):
             for q in qq:
@@ -456,7 +460,7 @@ class SAMLStoreBase(object):
         if f:
             mexpr = "+".join(f)
 
-        log.debug("match using '%s'" % mexpr)
+        log.debug(f"match using '{mexpr}'")
         res = []
         for e in self.lookup(mexpr):
             d = None
@@ -464,7 +468,7 @@ class SAMLStoreBase(object):
                 m = _match(query, e)
                 if m is not None:
                     d = entity_simple_summary(e)
-                    ll = d['title'].lower()
+                    _ll = d['title'].lower()
                     d['matched'] = m
             else:
                 d = entity_simple_summary(e)
@@ -518,12 +522,12 @@ class EmptyStore(SAMLStoreBase):
 class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for keys (uuids)
     def json_dict(self, name):
         return LRUProxyDict(
-            JSONDict(key='{}_{}'.format(self._name, name), redis=self._redis, writeback=True), maxsize=config.cache_size
+            JSONDict(key=f'{self._name}_{name}', redis=self._redis, writeback=True), maxsize=config.cache_size
         )
 
     def xml_dict(self, name):
         return LRUProxyDict(
-            XMLDict(key='{}_{}'.format(self._name, name), redis=self._redis, writeback=True), maxsize=config.cache_size
+            XMLDict(key=f'{self._name}_{name}', redis=self._redis, writeback=True), maxsize=config.cache_size
         )
 
     def __init__(self, *args, **kwargs):
@@ -575,8 +579,8 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
         watched = kwargs.pop('watched', None)
         scheduler = kwargs.pop('scheduler', None)
         if watched is not None and scheduler is not None:
-            super(RedisWhooshStore, self).__call__(watched=watched, scheduler=scheduler)
-            log.debug("indexing using {}".format(scheduler))
+            super().__call__(watched=watched, scheduler=scheduler)
+            log.debug(f"indexing using {scheduler}")
             if scheduler is not None:  # and self._last_modified > self._last_index_time and :
                 scheduler.add_job(
                     RedisWhooshStore._reindex,
@@ -590,7 +594,7 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
         log.debug("indexing the store...")
         self._last_index_time = datetime.now()
         seen = set()
-        refs = set([b2u(s) for s in self.objects.keys()])
+        refs = {b2u(s) for s in self.objects.keys()}
         parts = self.parts.values()
         for ref in refs:
             for part in parts:
@@ -606,7 +610,7 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
             with ix.writer() as writer:
                 for ref in refs:
                     if ref not in seen:
-                        log.debug("removing unseen ref {}".format(ref))
+                        log.debug(f"removing unseen ref {ref}")
                         del self.objects[ref]
                         del self.parts[ref]
 
@@ -621,7 +625,7 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
             try:
                 log.debug("releasing index lock")
                 lock.release()
-            except ThreadError as ex:
+            except ThreadError as _ex:
                 pass
 
     def dump(self):
@@ -629,7 +633,7 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
         from whoosh.query import Every
 
         with ix.searcher() as searcher:
-            for result in ix.searcher().search(Every('object_id')):
+            for result in searcher.search(Every('object_id')):
                 print(result)
 
     def _index_prep(self, info):
@@ -653,7 +657,7 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
             if k in self.schema.names():
                 if type(v) in (list, tuple):
                     res[k] = " ".join([vv.lower() for vv in v])
-                elif type(v) in six.string_types:
+                elif type(v) in (str,):
                     res[k] = info[a].lower()
         res['sha1'] = hash_id(info['entity_id'], prefix=False)
         return res
@@ -662,7 +666,7 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
         relt = root(t)
         assert relt is not None
 
-        if relt.tag == "{%s}EntityDescriptor" % NS['md']:
+        if relt.tag == "{{{}}}EntityDescriptor".format(NS['md']):
             ref = object_id(relt)
             parts = None
             if ref in self.parts:
@@ -671,7 +675,7 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
                 self.parts[ref] = {'id': relt.get('entityID'), 'etag': etag, 'count': 1, 'items': [ref]}
                 self.objects[ref] = relt
                 self._last_modified = datetime.now()
-        elif relt.tag == "{%s}EntitiesDescriptor" % NS['md']:
+        elif relt.tag == "{{{}}}EntitiesDescriptor".format(NS['md']):
             if tid is None:
                 tid = relt.get('Name')
             if etag is None:
@@ -706,7 +710,7 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
         elif a is not None and v is None:
             return len(self.attribute(a))
         else:
-            return len(self.lookup("{!s}={!s}".format(a, v)))
+            return len(self.lookup(f"{a!s}={v!s}"))
 
     def _attributes(self):
         ix = self.storage.open_index()
@@ -734,9 +738,9 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
         key = key.replace('-', ' AND NOT ')
         for uri, a in list(ATTRS_INV.items()):
             key = key.replace(uri, a)
-        key = " {!s} ".format(key)
-        key = re.sub("([^=]+)=(\S+)", "\\1:\\2", key)
-        key = re.sub("{([^}]+)}(\S+)", "\\1:\\2", key)
+        key = f" {key!s} "
+        key = re.sub(r"([^=]+)=(\S+)", "\\1:\\2", key)
+        key = re.sub(r"{([^}]+)}(\S+)", "\\1:\\2", key)
         key = key.strip()
 
         return key
@@ -756,7 +760,7 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
         if key == 'entities' or key is None:
             return self._entities()
 
-        bkey = six.b(key)
+        bkey = key.encode('latin-1')
         if bkey in self.objects:
             return [self.objects.get(bkey)]
 
@@ -783,7 +787,7 @@ class RedisWhooshStore(SAMLStoreBase):  # TODO: This needs a gc mechanism for ke
     @ttl_cache(ttl=config.cache_ttl, maxsize=config.cache_size)
     def search(self, query=None, path=None, entity_filter=None, related=None):
         if entity_filter:
-            query = "{!s} AND {!s}".format(query, entity_filter)
+            query = f"{query!s} AND {entity_filter!s}"
         query = self._prep_key(query)
         qp = MultifieldParser(['content', 'domain'], schema=self.schema)
         q = qp.parse(query)
@@ -879,13 +883,13 @@ class MemoryStore(SAMLStoreBase):
     def update(self, t, tid=None, etag=None, lazy=True):
         relt = root(t)
         assert relt is not None
-        if relt.tag == "{%s}EntityDescriptor" % NS['md']:
+        if relt.tag == "{{{}}}EntityDescriptor".format(NS['md']):
             self._unindex(relt)
             self._index(relt)
             self.entities[relt.get('entityID')] = relt  # TODO: merge?
             if tid is not None:
                 self.md[tid] = [relt.get('entityID')]
-        elif relt.tag == "{%s}EntitiesDescriptor" % NS['md']:
+        elif relt.tag == "{{{}}}EntitiesDescriptor".format(NS['md']):
             if tid is None:
                 tid = relt.get('Name')
             lst = []
@@ -927,7 +931,7 @@ class MemoryStore(SAMLStoreBase):
 
         m = re.match("^(.+)=(.+)$", key)
         if m:
-            return self._lookup("{%s}%s" % (m.group(1), str(m.group(2)).rstrip("/")))
+            return self._lookup("{{{}}}{}".format(m.group(1), str(m.group(2)).rstrip("/")))
 
         m = re.match("^{(.+)}(.+)$", key)
         if m:
@@ -942,7 +946,7 @@ class MemoryStore(SAMLStoreBase):
             lst = []
             for entityID in self.md[key]:
                 lst.extend(self.lookup(entityID))
-            log.debug("returning {} entities".format(len(lst)))
+            log.debug(f"returning {len(lst)} entities")
             return lst
 
         return []
