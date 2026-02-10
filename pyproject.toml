@@ -34,25 +34,26 @@ dependencies = [
     "requests>=2.32.3",
     "requests-cache>=1.2.1",
     "requests-file>=2.1.0",
-    "setuptools>=78.1.1",
+    "setuptools>=42.0.0",
     "str2bool>=1.1",
-    "urllib3==2.5.0",
     "whoosh>=2.7.4",
     "wsgi-intercept>=1.13.1",
     "xmldiff>=2.7.0",
 ]
 
-[dependency-groups]
+[project.optional-dependencies]
 docs = ["sphinx",
      "sphinx-rtd-theme"
 ]
 dev = [
     "coverage",
+    "coveralls",
     "fakeredis>=1.0.5",
     "funcsigs",
     "isort",
     "mako",
     "mock",
+    "mypy",
     "pbr",
     "pytest>=6.0.0",
     "pytest-cov",

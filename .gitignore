@@ -27,3 +27,4 @@ localconfig.py
 docs/code
 MANIFEST
 .vscode
+.venv/
