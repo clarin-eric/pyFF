@@ -200,7 +200,7 @@ class PyFFAPITestResources(PipeLineTest):
             expected = [
                 {
                     'Resource': f'file://{self.test01}',
-                    'HTTP Response Headers': {'Content-Length': 3633},
+                    'HTTP Response Headers': {'Content-Length': '3633'},
                     'Status Code': '200',
                     'Reason': None,
                     'State': 'Ready',
